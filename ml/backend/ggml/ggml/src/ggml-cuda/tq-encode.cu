@@ -1,5 +1,4 @@
 #include "tq-encode.cuh"
-#include <cuda_fp16.h>
 #include <math.h>
 
 #define TQ_ENCODE_BLOCK_SIZE 128
