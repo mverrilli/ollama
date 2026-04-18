@@ -689,10 +689,12 @@ func (b *Backend) NewContext() ml.Context {
 }
 
 // TQDeviceScan describes the GPU devices discovered in the scheduler from the
-// perspective of TurboQuant: which one TQ will use (the first with cc >= 6.0),
-// plus the names of any GPUs that were skipped because they're too old. Used to
-// emit actionable warnings and to avoid dispatching TQ kernels to a Maxwell
-// (cc < 6.0) card that would hit the compute-capability assert at launch.
+// perspective of TurboQuant: which one TQ will use, plus the names of any GPUs
+// that were skipped because they're not wave32-capable (NVIDIA < Pascal, or
+// AMD wave64 Vega/GCN/CDNA). Used to emit actionable warnings and to avoid
+// dispatching TQ kernels to an unsupported card — either one that would hit
+// the compute-capability assert in tq-dequant.cu or one whose HIP __shfl_sync
+// shim would silently produce garbage on 64-lane warps.
 type TQDeviceScan struct {
 	// selected is the buffer type TQ will place its tensors on. Zero-valued
 	// if no TQ-capable GPU is present.
@@ -702,15 +704,18 @@ type TQDeviceScan struct {
 	SelectedCC   string // e.g. "6.1"
 	// Accepted lists "<name> (cc X.Y)" for every TQ-capable GPU in schedBufts.
 	Accepted []string
-	// Skipped lists "<name> (cc X.Y)" for every non-host GPU in schedBufts whose
-	// compute capability is below 6.0 (TQ kernels require __shfl_sync).
+	// Skipped lists "<name> (cc X.Y, <library>): <reason>" for every non-host GPU
+	// in schedBufts that fails the wave32 gate (CUDA < Pascal, ROCm wave64, or a
+	// non-CUDA/ROCm backend). The reason is included so operators can diagnose
+	// without reading the source tree.
 	Skipped []string
 }
 
-// scanTQDevices walks the scheduler buffer types and classifies each GPU as
-// either TQ-capable (cc >= 6.0) or skipped (cc < 6.0, or non-GPU). The first
-// TQ-capable buffer type is marked as selected; TQ tensors will be placed
-// there regardless of which scheduler index it occupies.
+// scanTQDevices walks the scheduler buffer types and classifies each GPU via
+// tqDeviceAccepted: accepted GPUs (NVIDIA Pascal+, AMD RDNA1+) are eligible to
+// host TQ tensors; others are skipped with a diagnosable reason. The first
+// accepted buffer type is marked as selected; TQ tensors will be placed there
+// regardless of which scheduler index it occupies.
 func (b *Backend) scanTQDevices() TQDeviceScan {
 	var scan TQDeviceScan
 	for _, buft := range b.schedBufts {
@@ -724,13 +729,18 @@ func (b *Backend) scanTQDevices() TQDeviceScan {
 		var props C.struct_ggml_backend_dev_props
 		C.ggml_backend_dev_get_props(dev, &props)
 		name := C.GoString(props.name)
+		var library string
+		if props.library != nil {
+			library = C.GoString(props.library)
+		}
 		cc := fmt.Sprintf("%d.%d", int(props.compute_major), int(props.compute_minor))
-		label := fmt.Sprintf("%s (cc %s)", name, cc)
-		if int(props.compute_major) < 6 {
-			scan.Skipped = append(scan.Skipped, label)
+		accepted, skipReason := tqDeviceAccepted(library, int(props.compute_major))
+		if !accepted {
+			scan.Skipped = append(scan.Skipped,
+				fmt.Sprintf("%s (cc %s, %s): %s", name, cc, library, skipReason))
 			continue
 		}
-		scan.Accepted = append(scan.Accepted, label)
+		scan.Accepted = append(scan.Accepted, fmt.Sprintf("%s (cc %s)", name, cc))
 		if !scan.selectedOK {
 			scan.selected = buft
 			scan.selectedOK = true
@@ -741,13 +751,15 @@ func (b *Backend) scanTQDevices() TQDeviceScan {
 	return scan
 }
 
-// newTQContext creates a GGML context whose tensors are allocated in GPU (CUDA)
-// memory. Used by the TQ compressed KV cache manager: TQ encode/decode ops are
-// CUDA-only and require their tensors (packed buffers, scales, codebook,
+// newTQContext creates a GGML context whose tensors are allocated in GPU
+// memory (CUDA or HIP). Used by the TQ compressed KV cache manager: TQ
+// encode/decode ops require their tensors (packed buffers, scales, codebook,
 // rotation matrix) to reside on the GPU regardless of which model layers are
-// on CPU vs GPU. TQ tensors always land on the first TQ-capable GPU (cc >= 6.0)
-// in the scheduler; in a mixed-generation rig (e.g. Maxwell + Pascal), older
-// cards are skipped to avoid the kernel-side compute-capability assert.
+// on CPU vs GPU. TQ tensors always land on the first TQ-capable GPU — NVIDIA
+// Pascal (cc 6.0) or newer, or AMD RDNA1 (gfx1010) or newer — in the
+// scheduler. In a mixed rig, unsupported cards are skipped: older NVIDIA
+// would hit the compute-capability assert in tq-dequant.cu, and wave64 AMD
+// (Vega/CDNA) would silently corrupt through the HIP __shfl_sync shim.
 func (b *Backend) newTQContext(n int) *Context {
 	var allocatedBuffers []C.ggml_backend_buffer_t
 	scan := b.scanTQDevices()

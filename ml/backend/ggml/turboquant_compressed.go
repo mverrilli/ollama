@@ -102,16 +102,19 @@ func (m *ggmlTQCompressedK) outlierPackedBytes() int {
 }
 
 func (b *Backend) NewTQCompressedKManager(headDim, numKVHeads, bits int, rotationSeed uint64, vBits, outlierBits, outlierCount int) ml.TQCompressedKManager {
-	// TurboQuant ops are CUDA-only and require compute capability 6.0+ (Pascal
-	// or newer) because the kernels use __shfl_sync for codebook lookup. Scan
-	// the scheduler buffer types, pick the first TQ-capable GPU, and warn
-	// clearly if there's no suitable device or if a mixed-generation rig forces
-	// us to skip older cards.
+	// TurboQuant ops run on CUDA (NVIDIA Pascal+) or ROCm/HIP (AMD RDNA1+,
+	// gfx1010+). The gate is wave32: the kernels hard-code a 32-lane
+	// __shfl_sync for codebook lookup, and on a wave64 warp the HIP shim's
+	// __shfl(…, 32) sub-partitions into two 32-lane groups whose upper half
+	// has no codebook data — so Vega/GCN/CDNA would corrupt if admitted.
+	// Scan the scheduler buffer types, pick the first TQ-capable GPU, and
+	// warn clearly if there's no suitable device or if a mixed-architecture
+	// rig forces us to skip unsupported cards.
 	scan := b.scanTQDevices()
 	if !scan.selectedOK {
 		if len(scan.Skipped) > 0 {
-			slog.Warn("turboquant: no GPU with compute capability 6.0+ available; "+
-				"falling back to f16 KV cache. TurboQuant requires Pascal or newer.",
+			slog.Warn("turboquant: no TQ-capable GPU found; falling back to f16 KV cache. "+
+				"TurboQuant requires NVIDIA Pascal (cc 6.0+) or AMD RDNA1+ (gfx1010+, wave32).",
 				"skipped_gpus", scan.Skipped)
 		} else {
 			slog.Warn("turboquant: no GPU backend available, falling back to f16 KV cache")
@@ -119,9 +122,9 @@ func (b *Backend) NewTQCompressedKManager(headDim, numKVHeads, bits int, rotatio
 		return nil
 	}
 	if len(scan.Skipped) > 0 {
-		slog.Warn("turboquant: skipping GPU(s) with compute capability < 6.0; "+
-			"TQ tensors will be placed on the first Pascal+ device. "+
-			"To silence this warning, hide older cards with CUDA_VISIBLE_DEVICES.",
+		slog.Warn("turboquant: skipping unsupported GPU(s); TQ tensors will be placed on the "+
+			"first wave32 device (NVIDIA Pascal+ or AMD RDNA1+). To silence this warning, "+
+			"hide the unsupported cards with CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES.",
 			"selected", scan.SelectedName+" (cc "+scan.SelectedCC+")",
 			"skipped", scan.Skipped)
 	}
