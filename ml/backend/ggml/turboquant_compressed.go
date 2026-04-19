@@ -248,6 +248,12 @@ func (m *ggmlTQCompressedK) EnsureLayer(layer, capacity int) {
 	// TQ tensors must always be GPU-resident; use newTQContext, not Layer(layer),
 	// which would allocate CPU memory for layers assigned to CPU.
 	ctx := m.backend.newTQContext(ctxHint)
+	// Opt this layer's TQ persistent buffers into the scheduler's per-layer
+	// Cache accounting so the (packed K, scales, optional outlier sub-block)
+	// tensors below flow into btDeviceMemory.Cache[layer] via newTensor, not
+	// the anonymous Graph bucket. Without this, scanTQDevices' scheduler can't
+	// see TQ's real KV footprint and may mis-plan context-fit decisions.
+	ctx.layer = layer
 	// packed: interleaved as (cell*numKVHeads+head)*packedBytes — matches encode kernel layout.
 	packed := ctx.Zeros(ml.DTypeI8, packedBytes*m.numKVHeads, capacity).(*Tensor)
 	// scales: scales[cell*numKVHeads+head] — cell-major.
@@ -409,9 +415,15 @@ func (m *ggmlTQCompressedK) EnsureVLayer(layer, capacity int) {
 	if _, ok := m.vPackedTensors[layer]; ok {
 		return
 	}
-	packedBytes := (m.headDim*m.vBits + 7) / 8
+	// 4-byte alignment — matches regularPackedBytes() so the scheduler and the
+	// Go-side allocator agree on padded bytes per head. The encode/dequant
+	// kernels read the raw bits; padding is never touched.
+	raw := (m.headDim*m.vBits + 7) / 8
+	packedBytes := (raw + 3) &^ 3
 
 	ctx := m.backend.newTQContext(2)
+	// Same per-layer Cache accounting as EnsureLayer — see that comment for why.
+	ctx.layer = layer
 	packed := ctx.Zeros(ml.DTypeI8, packedBytes*m.numKVHeads, capacity).(*Tensor)
 	scales := ctx.Zeros(ml.DTypeF32, m.numKVHeads, capacity).(*Tensor)
 
