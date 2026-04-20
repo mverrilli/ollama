@@ -29,12 +29,12 @@ import (
 // full tqbench matrix covers real-model runtime verification.
 //
 // The test is kept in place because:
-//   1. It's the correct scaffolding for a future GPU unit-test harness.
-//   2. It documents the exact CPU↔GPU equivalence contract the kernels
-//      must satisfy.
-//   3. Once schedBufts is populated (either by a better harness or by
-//      a future ggml change), the test becomes a regression gate
-//      automatically — no further wiring needed.
+//  1. It's the correct scaffolding for a future GPU unit-test harness.
+//  2. It documents the exact CPU↔GPU equivalence contract the kernels
+//     must satisfy.
+//  3. Once schedBufts is populated (either by a better harness or by
+//     a future ggml change), the test becomes a regression gate
+//     automatically — no further wiring needed.
 func TestOutlierEncodeDequantGPUCPUEquivalence(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -63,7 +63,7 @@ func TestOutlierEncodeDequantGPUCPUEquivalence(t *testing.T) {
 				tc.outlierBits, tc.outlierCount,
 			)
 			if mgrAny == nil {
-				t.Skip("no TQ-capable GPU available (need compute capability >= 6.0)")
+				t.Skip("no TQ-capable GPU available (need NVIDIA Pascal cc 6.0+ or AMD RDNA1+)")
 			}
 			mgr, ok := mgrAny.(*ggmlTQCompressedK)
 			if !ok {

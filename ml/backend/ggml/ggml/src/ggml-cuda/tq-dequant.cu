@@ -1,5 +1,4 @@
 #include "tq-dequant.cuh"
-#include <cuda_fp16.h>
 
 // Optimized TQ dequant kernel: warp-shuffle codebook + hardcoded bit extraction.
 //
@@ -52,8 +51,11 @@ __global__ void tq_dequant_multihead_kernel(
         }
 
         // Codebook lookup via warp shuffle: zero global memory latency.
-        // Width = warpSize (32) works because cb_lane is periodic with period (1<<bits).
-        float val = __shfl_sync(0xFFFFFFFF, cb_lane, idx) * scale;
+        // Width = 32 works because cb_lane is periodic with period (1<<bits).
+        // Pass width explicitly — the HIP __shfl_sync shim is a 4-arg macro
+        // that doesn't default, and CUDA's 3-arg overload is width=warpSize=32
+        // anyway, so this is behavior-neutral on NVIDIA.
+        float val = __shfl_sync(0xFFFFFFFF, cb_lane, idx, 32) * scale;
         cell_out[elem] = __float2half_rn(val);
     }
 }
@@ -180,7 +182,7 @@ __global__ void tq_dequant_multihead_kernel_outlier(
         if (reg_shift + bits > 8) {
             reg_idx |= (cell_reg[reg_byte_idx + 1] << (8 - reg_shift)) & cb_mask;
         }
-        float reg_val = __shfl_sync(0xFFFFFFFF, cb_lane_reg, reg_idx) * regScale;
+        float reg_val = __shfl_sync(0xFFFFFFFF, cb_lane_reg, reg_idx, 32) * regScale;
 
         int out_slot_safe = (outlier_slot >= 0) ? outlier_slot : 0;
         int out_bit_offset = out_slot_safe * outlier_bits;
@@ -190,7 +192,7 @@ __global__ void tq_dequant_multihead_kernel_outlier(
         if (out_shift + outlier_bits > 8) {
             out_idx |= (cell_outl[out_byte_idx + 1] << (8 - out_shift)) & ocb_mask;
         }
-        float out_val = __shfl_sync(0xFFFFFFFF, cb_lane_out, out_idx) * outScale;
+        float out_val = __shfl_sync(0xFFFFFFFF, cb_lane_out, out_idx, 32) * outScale;
 
         float val = (outlier_slot >= 0) ? out_val : reg_val;
         cell_out[elem] = __float2half_rn(val);
@@ -308,7 +310,7 @@ __global__ void tq_dequant_v_rotated_kernel(
     if (shift + bits > 8) {
         idx |= (cell_packed[byte_idx + 1] << (8 - shift)) & cb_mask;
     }
-    s_rotV[elem] = __shfl_sync(0xFFFFFFFF, cb_lane, idx) * scale;
+    s_rotV[elem] = __shfl_sync(0xFFFFFFFF, cb_lane, idx, 32) * scale;
     __syncthreads();
 
     // Phase 2: each thread computes one output element = dot(R[elem,:], s_rotV).

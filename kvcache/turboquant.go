@@ -174,14 +174,33 @@ func (c *TurboQuantCache) Put(ctx ml.Context, key, value ml.Tensor) {
 		c.numKVHeads = key.Dim(1)
 	}
 
-	if c.isReserve {
-		c.meta.Put(ctx, key, value)
-		return
-	}
-
-	if !c.phase2Checked {
+	// Activate the GPU encode path on the first Put (reserve or not) once we
+	// know headDim/numKVHeads. Doing this during reserve lets EnsureLayer run
+	// on the reserve pass, which books TQ's per-layer persistent K/V buffers
+	// into btDeviceMemory.Cache[layer] (via newTensor's ctx.layer accounting
+	// in EnsureLayer). Without this, the scheduler's fit/alloc probe sees a
+	// 0-byte Cache for tq2/tq3 and only the f16 V half for tq2k/tq3k, which
+	// is wrong for both headline-footprint reporting and long-context fit math.
+	if !c.phase2Checked && c.headDim > 0 {
 		c.phase2Checked = true
 		c.activateGPUEncode()
+	}
+
+	if c.isReserve {
+		c.meta.Put(ctx, key, value)
+		// Eagerly allocate TQ persistent buffers during reserve so the scheduler's
+		// per-layer Cache totals reflect the real post-compression footprint. No
+		// encode kernels run on reserve — we only need the tensors in the layer
+		// context so newTensor's c.b.btDeviceMemory[...].Cache[layer] bump fires.
+		if c.compressedK != nil {
+			layer := c.meta.curLayer
+			capacity := len(c.meta.cells)
+			c.compressedK.EnsureLayer(layer, capacity)
+			if c.preset.ValueBits > 0 {
+				c.compressedK.EnsureVLayer(layer, capacity)
+			}
+		}
+		return
 	}
 
 	if c.compressedK != nil {
