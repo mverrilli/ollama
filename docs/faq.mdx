@@ -363,8 +363,8 @@ The currently available K/V cache quantization types are:
 - `f16` - high precision and memory usage (default).
 - `q8_0` - 8-bit quantization, uses approximately 1/2 the memory of `f16` with a very small loss in precision, this usually has no noticeable impact on the model's quality (recommended if not using f16).
 - `q4_0` - 4-bit quantization, uses approximately 1/4 the memory of `f16` with a small-medium loss in precision that may be more noticeable at higher context sizes.
-- `tq3k` - TurboQuant 3-bit K-only quantization, uses approximately 2/5 the memory of `f16` with a negligible quality impact, and unlike `q4_0`/`q8_0` does not require Flash Attention to be enabled.
-- `tq2k` - TurboQuant 2-bit K-only quantization, uses approximately 1/3 the memory of `f16` with a small quality impact, and unlike `q4_0`/`q8_0` does not require Flash Attention to be enabled.
+- `tq3k` - TurboQuant 3-bit K-only quantization, uses approximately 3/5 the memory of `f16` with a negligible quality impact, and unlike `q4_0`/`q8_0` does not require Flash Attention to be enabled.
+- `tq2k` - TurboQuant 2-bit K-only quantization, uses approximately 3/5 the memory of `f16` with a small quality impact, and unlike `q4_0`/`q8_0` does not require Flash Attention to be enabled.
 - `tq3` - TurboQuant 3-bit K and V quantization, uses approximately 1/5 the memory of `f16` with a negligible quality impact. Requires Flash Attention.
 - `tq2` - TurboQuant 2-bit K and V quantization, uses approximately 1/7 the memory of `f16` with a small quality impact. Requires Flash Attention.
 
