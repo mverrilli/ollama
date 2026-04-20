@@ -57,9 +57,13 @@ func tqDeviceAccepted(library string, ccMajor int) (accepted bool, skipReason st
 				"lanes 32-63 (gfx major=%d)",
 			ccMajor,
 		)
+	case "Metal":
+		// Apple Silicon always has 32-wide SIMD groups — same as CUDA warp width.
+		// TQ's __shfl_sync(mask, val, lane, 32) maps to simd_shuffle(val, lane) 1:1.
+		return true, ""
 	default:
 		return false, fmt.Sprintf(
-			"TurboQuant requires a CUDA or ROCm backend library; got library=%q",
+			"TurboQuant requires a CUDA, ROCm, or Metal backend library; got library=%q",
 			library,
 		)
 	}
