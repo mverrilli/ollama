@@ -4602,9 +4602,16 @@ int ggml_metal_op_tq_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         /*.nb31         =*/ mask ? mask->nb[1] : 0,
     };
 
+    // Select D=128 vs D=256 pipeline. Gemma3 runs at headDim=256; everything
+    // else supported so far is D=128.
+    GGML_ASSERT(D == 128 || D == 256);
     auto pipeline = v_packed
-        ? ggml_metal_library_get_pipeline_tq_fattn_vec_packed(lib)
-        : ggml_metal_library_get_pipeline_tq_fattn_vec_f16(lib);
+        ? (D == 256
+            ? ggml_metal_library_get_pipeline_tq_fattn_vec_packed_d256(lib)
+            : ggml_metal_library_get_pipeline_tq_fattn_vec_packed(lib))
+        : (D == 256
+            ? ggml_metal_library_get_pipeline_tq_fattn_vec_f16_d256(lib)
+            : ggml_metal_library_get_pipeline_tq_fattn_vec_f16(lib));
 
     ggml_metal_buffer_id bid_mask       = hasMask  ? ggml_metal_get_buffer_id(mask)       : ggml_metal_get_buffer_id(op);
     ggml_metal_buffer_id bid_v_scales   = v_packed ? ggml_metal_get_buffer_id(op->src[6]) : ggml_metal_get_buffer_id(op);
