@@ -10221,48 +10221,6 @@ kernel void kernel_opt_step_sgd_f32(
 // TurboQuant kernels
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Pack N-bit quantized indices into a word-aligned output buffer.
-// Uses threadgroup atomic OR so threads can write in parallel.
-// nWords = (headDim * bits + 7) / 8 / 4  (rounded up to 4-byte words)
-static inline void tq_pack_bits(
-    threadgroup atomic_uint * tg_packed,
-    uint                      nWords,
-    device       uint       * out_words,
-    uint                      elem,
-    uint                      headDim,
-    uint                      bits,
-    uint8_t                   val,
-    uint                      tiisg)
-{
-    // Zero the buffer.
-    for (uint i = tiisg; i < nWords; i += 32) {
-        atomic_store_explicit(&tg_packed[i], 0u, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Each thread ORs its element's bits in.
-    if (elem < headDim) {
-        const uint bit_offset = elem * bits;
-        const uint byte_idx   = bit_offset >> 3;
-        const uint shift      = bit_offset & 7;
-        const uint v          = (uint)val;
-
-        atomic_fetch_or_explicit(&tg_packed[byte_idx >> 2],
-            (v << shift) << ((byte_idx & 3) * 8), memory_order_relaxed);
-        if (shift + bits > 8) {
-            const uint byte_idx2 = byte_idx + 1;
-            atomic_fetch_or_explicit(&tg_packed[byte_idx2 >> 2],
-                (v >> (8 - shift)) << ((byte_idx2 & 3) * 8), memory_order_relaxed);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Copy packed words to device memory.
-    for (uint i = tiisg; i < nWords; i += 32) {
-        out_words[i] = atomic_load_explicit(&tg_packed[i], memory_order_relaxed);
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // kernel_tq_dequant
 // Grid:  (nCells, numKVHeads, 1)
