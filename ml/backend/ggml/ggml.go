@@ -700,8 +700,9 @@ type TQDeviceScan struct {
 	// if no TQ-capable GPU is present.
 	selected     C.ggml_backend_buffer_type_t
 	selectedOK   bool
-	SelectedName string // e.g. "NVIDIA Tesla P40"
-	SelectedCC   string // e.g. "6.1"
+	SelectedName    string // e.g. "NVIDIA Tesla P40"
+	SelectedCC      string // e.g. "6.1"
+	SelectedLibrary string // e.g. "Metal", "CUDA", "ROCm"
 	// Accepted lists "<name> (cc X.Y)" for every TQ-capable GPU in schedBufts.
 	Accepted []string
 	// Skipped lists "<name> (cc X.Y, <library>): <reason>" for every non-host GPU
@@ -746,6 +747,7 @@ func (b *Backend) scanTQDevices() TQDeviceScan {
 			scan.selectedOK = true
 			scan.SelectedName = name
 			scan.SelectedCC = cc
+			scan.SelectedLibrary = library
 		}
 	}
 	return scan

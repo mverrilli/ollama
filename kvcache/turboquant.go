@@ -45,6 +45,14 @@ type TurboQuantCache struct {
 	// Remove once the fused kernels gain D=256/512 template instantiations.
 	fusedFallbackEligible bool
 
+	// preferFusedAttn is true on Metal. At long context, DequantKV + stock FA
+	// writes a full f16 intermediate buffer (doubling KV bandwidth) before
+	// attention reads it. The fused kernel (kernel_tq_fattn_vec_packed) reads
+	// packed K+V directly and skips the intermediate write — dramatically
+	// faster on Metal. On CUDA the DequantKV path is preferred because the
+	// intermediate buffer stays in L2 and stock flash attention is highly tuned.
+	preferFusedAttn bool
+
 	// rotMatrix is the R^T rotation matrix sized for this cache's headDim.
 	// Set in activateGPUEncode. Get() sets the backend's tqRotationMatrix to
 	// this value per-call (consume-once) right before returning rotated K.
@@ -319,10 +327,12 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 			}
 		}
 
-		// 1. Combined K+V dequant → stock FA (default, fastest path).
-		//    Single GGML op dequants both K and V to f16, then stock FA
-		//    handles the bandwidth-bound attention with no decode ALU.
-		if vEncodeResult != nil {
+		// 1. Combined K+V dequant → stock FA (default on CUDA/ROCm).
+		//    Single GGML op dequants both K and V to f16, then stock FA runs.
+		//    On Metal this path is skipped in favour of path 2: DequantKV writes
+		//    a full f16 intermediate buffer which doubles KV bandwidth at long
+		//    context, whereas the fused kernel reads packed K+V directly.
+		if vEncodeResult != nil && !c.preferFusedAttn {
 			key, value := c.compressedK.DequantKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells)
 			if key != nil && value != nil {
 				c.logPathOnce[1].Do(func() {
@@ -334,18 +344,35 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 			}
 		}
 
-		// 2. K+V fused inline-decode fallback: used only when DequantKV is
-		//    unsupported (rare).  The inline-decode kernel is slower than the
-		//    DequantKV + stock FA path on all measured hardware, and is only
-		//    instantiated at D=128 — skip it for larger head dims.
+		// 2. K+V fused inline-decode: reads packed K+V directly, no f16 intermediate.
+		//    Primary path on Metal (preferFusedAttn=true); fallback on CUDA/ROCm.
+		//    Only instantiated at D=128 — skip for larger head dims.
 		if vEncodeResult != nil && c.fusedFallbackEligible {
 			if tqkv, ok := c.compressedK.GetAsTQTensorKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells); ok {
 				c.logPathOnce[2].Do(func() {
-					slog.Warn("turboquant: falling back to K+V inline-decode fused kernel (slower)")
+					if c.preferFusedAttn {
+						slog.Info("turboquant: using K+V fused inline-decode path (Metal: avoids f16 intermediate)")
+					} else {
+						slog.Warn("turboquant: falling back to K+V inline-decode fused kernel (slower)")
+					}
 				})
 				_, _, mask := c.meta.Get(ctx)
 				c.armRotationForNextSDPA()
 				return tqkv, nil, mask
+			}
+		}
+
+		// 1b. DequantKV fallback when fused path is preferred but unavailable
+		//     (e.g. headDim != 128, or GetAsTQTensorKV returned false on Metal).
+		if vEncodeResult != nil && c.preferFusedAttn {
+			key, value := c.compressedK.DequantKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells)
+			if key != nil && value != nil {
+				c.logPathOnce[1].Do(func() {
+					slog.Info("turboquant: using combined DequantKV + stock FA path (fused unavailable)")
+				})
+				_, _, mask := c.meta.Get(ctx)
+				c.armRotationForNextSDPA()
+				return key, value, mask
 			}
 		}
 
@@ -451,6 +478,16 @@ func (c *TurboQuantCache) activateGPUEncode() {
 	if !c.fusedFallbackEligible {
 		slog.Info("turboquant: inline-decode fused-FA fallback paths disabled",
 			"reason", "headDim != 128", "headDim", c.headDim)
+	}
+
+	type fusedAttnPreferrer interface {
+		PreferFusedAttention() bool
+	}
+	if ff, ok := mgr.(fusedAttnPreferrer); ok {
+		c.preferFusedAttn = ff.PreferFusedAttention()
+		if c.preferFusedAttn {
+			slog.Info("turboquant: preferring fused flash-attention path (Metal: avoids f16 intermediate buffer)")
+		}
 	}
 
 	// Cache the rotation matrices and the backend's rotation-setter hook on

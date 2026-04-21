@@ -64,11 +64,29 @@ type ggmlTQCompressedK struct {
 	// V codebook and boundaries (same bit width as K for tq2/tq3).
 	vCodebookTensor   *Tensor // [1<<vBits] f32
 	vBoundariesTensor *Tensor // [(1<<vBits)-1] f32
+
+	// preferFusedAttention is true on Metal. The DequantKV → stock FA path
+	// writes a full f16 intermediate buffer before attention, doubling KV
+	// bandwidth vs reading packed data directly. On Metal at long context the
+	// fused kernel (kernel_tq_fattn_vec_packed) is dramatically faster because
+	// it reads packed K+V once and never materialises the f16 intermediate.
+	// On CUDA, DequantKV + stock FA is faster because cuDNN/cuBLAS flash
+	// attention is highly tuned and the intermediate buffer stays in L2.
+	preferFusedAttention bool
 }
 
 // hasOutliers reports whether outlier-split is active for this manager.
 func (m *ggmlTQCompressedK) hasOutliers() bool {
 	return m.outlierCount > 0 && m.outlierBits > 0 && m.outlierCount < m.headDim
+}
+
+// PreferFusedAttention reports whether the fused flash-attention path
+// (packed K+V decoded inline) should be tried before DequantKV + stock FA.
+// True on Metal: the DequantKV path writes a full f16 intermediate buffer that
+// doubles KV bandwidth at long context. False on CUDA/ROCm where DequantKV +
+// stock FA is faster due to large L2 caches and highly-tuned flash attention.
+func (m *ggmlTQCompressedK) PreferFusedAttention() bool {
+	return m.preferFusedAttention
 }
 
 // regularChannelCount is the number of non-outlier channels per head.
@@ -218,6 +236,7 @@ func (b *Backend) NewTQCompressedKManager(headDim, numKVHeads, bits int, rotatio
 		vScalesTensors:          make(map[int]*Tensor),
 		vCodebookTensor:         vCodebookT,
 		vBoundariesTensor:       vBoundariesT,
+		preferFusedAttention:    scan.SelectedLibrary == "Metal",
 	}
 	if m.hasOutliers() {
 		slog.Info("turboquant: outlier split enabled",
