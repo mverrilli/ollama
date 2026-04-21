@@ -342,7 +342,16 @@ func (m *ggmlTQCompressedK) DequantK(ctx ml.Context, layer int, encodeResult ml.
 // inline-decode path is slower than DequantKV + stock FA on all measured
 // hardware — DequantKV is always preferred when available.
 func (m *ggmlTQCompressedK) fusedKernelSupports() bool {
-	if m.headDim != 128 {
+	// D=128 on all backends; D=256 only on Metal (kernel_tq_fattn_vec_*{,_d256}).
+	// CUDA still has only the D=128 kernel, so gemma3 (D=256) stays off the
+	// fused path on CUDA.
+	switch m.headDim {
+	case 128:
+	case 256:
+		if !m.preferFusedAttention {
+			return false
+		}
+	default:
 		return false
 	}
 	if m.bits != 2 && m.bits != 3 {
