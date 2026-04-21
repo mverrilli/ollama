@@ -99,3 +99,46 @@ func TestWrapWithTurboQuantTopLevelCausal(t *testing.T) {
 		t.Fatalf("expected TurboQuantCache.meta to point at the input Causal")
 	}
 }
+
+// TestWrapWithTurboQuantHybridCache verifies that a cache embedding *Recurrent
+// (matching the model/models/*/HybridCache shape) has its inner *Causal swapped
+// for a *TurboQuantCache in place, and the outer pointer is returned unchanged.
+func TestWrapWithTurboQuantHybridCache(t *testing.T) {
+	type HybridCache struct{ *Recurrent }
+	r := NewRecurrentCache(RecurrentConfig{ConvDim: 4, ConvChannels: 2, RecurrentStateSize: 4})
+	hc := &HybridCache{Recurrent: r}
+
+	wrapped, active := WrapWithTurboQuant(hc, turboquant.PresetTQ3K)
+
+	if !active {
+		t.Fatal("expected active=true for AttentionKVWrapper")
+	}
+	if wrapped != hc {
+		t.Fatalf("expected same pointer returned, got %T", wrapped)
+	}
+	tqc, ok := r.kv.(*TurboQuantCache)
+	if !ok {
+		t.Fatalf("expected inner kv to be *TurboQuantCache, got %T", r.kv)
+	}
+	if tqc.preset.Name != turboquant.PresetTQ3K.Name {
+		t.Fatalf("preset mismatch: got %q", tqc.preset.Name)
+	}
+}
+
+// TestWrapWithTurboQuantHybridCacheIdempotent verifies that a second wrap attempt
+// on an already-wrapped hybrid cache returns (cache, false) rather than double-wrapping.
+func TestWrapWithTurboQuantHybridCacheIdempotent(t *testing.T) {
+	type HybridCache struct{ *Recurrent }
+	r := NewRecurrentCache(RecurrentConfig{ConvDim: 4, ConvChannels: 2, RecurrentStateSize: 4})
+	hc := &HybridCache{Recurrent: r}
+
+	_, _ = WrapWithTurboQuant(hc, turboquant.PresetTQ3K)
+	wrapped, active := WrapWithTurboQuant(hc, turboquant.PresetTQ3K)
+
+	if active {
+		t.Fatal("expected active=false on second wrap (already wrapped)")
+	}
+	if wrapped != hc {
+		t.Fatalf("expected same pointer returned, got %T", wrapped)
+	}
+}

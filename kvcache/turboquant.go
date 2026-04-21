@@ -77,6 +77,17 @@ func isSWACausal(c *Causal) bool {
 	return c.swaWindowSize > 0 && c.swaWindowSize != math.MaxInt32
 }
 
+// AttentionKVWrapper is implemented by caches that embed *Recurrent and
+// expose the attention half of a hybrid (SSM/recurrent + attention) cache.
+// WrapWithTurboQuant uses it to inject TurboQuant compression into the
+// attention KV path without disturbing conv/recurrent state buffers.
+// *kvcache.Recurrent implements this interface, so any model HybridCache that
+// embeds *Recurrent satisfies it automatically via Go method promotion.
+type AttentionKVWrapper interface {
+	AttentionKV() *Causal
+	SetAttentionKV(Cache)
+}
+
 // WrapWithTurboQuant returns a cache that applies TurboQuant compression to
 // global-attention Causal layers and a bool reporting whether any wrapping
 // took effect. For a top-level *Causal (non-SWA), it returns a new
@@ -128,6 +139,26 @@ func WrapWithTurboQuant(cache Cache, preset turboquant.Preset) (Cache, bool) {
 		}
 		slog.Info("turboquant: wrapped Causal sub-caches inside WrapperCache",
 			"count", wrapped, "preset", preset.Name)
+		return cache, true
+
+	case AttentionKVWrapper:
+		inner := c.AttentionKV()
+		if inner == nil {
+			slog.Warn("turboquant: hybrid cache inner kv is not *Causal (already wrapped?), leaving as-is")
+			return cache, false
+		}
+		if isSWACausal(inner) {
+			slog.Warn("turboquant: hybrid cache inner *Causal is sliding-window, cannot wrap")
+			return cache, false
+		}
+		c.SetAttentionKV(&TurboQuantCache{
+			meta:           inner,
+			preset:         preset,
+			encodeResults:  make(map[int]ml.Tensor),
+			vEncodeResults: make(map[int]ml.Tensor),
+		})
+		slog.Info("turboquant: wrapped attention KV in hybrid recurrent cache",
+			"preset", preset.Name)
 		return cache, true
 
 	default:
