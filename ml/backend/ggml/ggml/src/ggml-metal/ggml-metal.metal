@@ -10373,10 +10373,12 @@ kernel void kernel_tq_encode(
     device       uint8_t * packed_out [[buffer(3)]],
     device       float   * scales_out [[buffer(4)]],
     device const float   * boundaries [[buffer(5)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tpitg [[thread_position_in_threadgroup]],
-    uint  ntpitg[[threads_per_threadgroup]])
+    uint3 tgpig  [[threadgroup_position_in_grid]],
+    uint3 tpitg_v [[thread_position_in_threadgroup]],
+    uint3 ntpitg_v[[threads_per_threadgroup]])
 {
+    const uint tpitg  = tpitg_v.x;
+    const uint ntpitg = ntpitg_v.x;
     const int batch = (int)tgpig.x;
     const int head  = (int)tgpig.y;
     const int cell  = args.firstCell + batch;
@@ -10505,10 +10507,12 @@ kernel void kernel_tq_encode_v(
     device       uint8_t * packed_out [[buffer(3)]],
     device       float   * scales_out [[buffer(4)]],
     device const float   * boundaries [[buffer(5)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tpitg [[thread_position_in_threadgroup]],
-    uint  ntpitg[[threads_per_threadgroup]])
+    uint3 tgpig   [[threadgroup_position_in_grid]],
+    uint3 tpitg_v  [[thread_position_in_threadgroup]],
+    uint3 ntpitg_v [[threads_per_threadgroup]])
 {
+    const uint tpitg  = tpitg_v.x;
+    const uint ntpitg = ntpitg_v.x;
     const int batch = (int)tgpig.x;
     const int head  = (int)tgpig.y;
     const int cell  = args.firstCell + batch;
@@ -10633,10 +10637,12 @@ kernel void kernel_tq_encode_outlier(
     device       float   * outlier_scales    [[buffer(7)]],
     device       uint8_t * outlier_indices   [[buffer(8)]],
     device const float   * outlier_boundaries[[buffer(9)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tpitg [[thread_position_in_threadgroup]],
-    uint  ntpitg[[threads_per_threadgroup]])
+    uint3 tgpig   [[threadgroup_position_in_grid]],
+    uint3 tpitg_v  [[thread_position_in_threadgroup]],
+    uint3 ntpitg_v [[threads_per_threadgroup]])
 {
+    const uint tpitg  = tpitg_v.x;
+    const uint ntpitg = ntpitg_v.x;
     const int batch = (int)tgpig.x;
     const int head  = (int)tgpig.y;
     const int cell  = args.firstCell + batch;
