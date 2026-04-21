@@ -238,6 +238,11 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                     return nil;
                 }
 
+                GGML_LOG_INFO("%s: compiled library function list:\n", __func__);
+                for (NSString * fn in [library functionNames]) {
+                    GGML_LOG_INFO("%s:   fn: %s\n", __func__, [fn UTF8String]);
+                }
+
 #if !__has_feature(objc_arc)
                 [options release];
 #endif
