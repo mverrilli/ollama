@@ -51,9 +51,21 @@ type TurboQuantCache struct {
 	// writes a full f16 intermediate buffer (doubling KV bandwidth) before
 	// attention reads it. The fused kernel (kernel_tq_fattn_vec_packed) reads
 	// packed K+V directly and skips the intermediate write — dramatically
-	// faster on Metal. On CUDA the DequantKV path is preferred because the
-	// intermediate buffer stays in L2 and stock flash attention is highly tuned.
+	// faster on Metal for *decode* (Q=1). On CUDA the DequantKV path is
+	// preferred because the intermediate buffer stays in L2 and stock flash
+	// attention is highly tuned.
+	//
+	// For prefill (Q>1, see curQueryLen) DequantKV wins on every backend
+	// because it decodes each packed cell once then runs stock FA with full
+	// batch amortisation, whereas the fused kernel re-decodes each cell per
+	// Q-token. Get() uses the combination of preferFusedAttn and curQueryLen
+	// to route prefill vs decode independently.
 	preferFusedAttn bool
+
+	// curQueryLen is the number of query tokens in the current forward pass,
+	// captured at StartForward from len(batch.Positions). curQueryLen==1
+	// means decode; curQueryLen>1 means prefill (or a batched prompt chunk).
+	curQueryLen int
 
 	// rotMatrix is the R^T rotation matrix sized for this cache's headDim.
 	// Set in activateGPUEncode. Get() sets the backend's tqRotationMatrix to
@@ -203,6 +215,7 @@ func (c *TurboQuantCache) SetConfig(config ml.CacheConfig) { c.meta.SetConfig(co
 
 func (c *TurboQuantCache) StartForward(ctx ml.Context, batch input.Batch, reserve bool) error {
 	c.isReserve = reserve
+	c.curQueryLen = len(batch.Positions)
 	clear(c.encodeResults)
 	clear(c.vEncodeResults)
 	return c.meta.StartForward(ctx, batch, reserve)
@@ -329,16 +342,28 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 			}
 		}
 
-		// 1. Combined K+V dequant → stock FA (default on CUDA/ROCm).
-		//    Single GGML op dequants both K and V to f16, then stock FA runs.
-		//    On Metal this path is skipped in favour of path 2: DequantKV writes
-		//    a full f16 intermediate buffer which doubles KV bandwidth at long
-		//    context, whereas the fused kernel reads packed K+V directly.
-		if vEncodeResult != nil && !c.preferFusedAttn {
+		// Prefill vs decode routing on Metal: the fused inline-decode kernel
+		// re-decodes each packed K/V cell per Q-token, so its cost scales
+		// O(nCells × nTokensQ). For prefill (nTokensQ ≫ 1) DequantKV + stock
+		// FA wins by decoding each cell once and then letting stock FA
+		// amortise the read across all Q-tokens. For decode (nTokensQ=1) the
+		// fused path wins by avoiding the f16 intermediate write. This flag
+		// routes independently of preferFusedAttn so CUDA (preferFusedAttn=
+		// false) continues to take path 1 for everything.
+		useDequantKVForPrefill := c.preferFusedAttn && c.curQueryLen > 1
+
+		// 1. Combined K+V dequant → stock FA.
+		//    * CUDA/ROCm: always (preferFusedAttn=false).
+		//    * Metal: prefill only (batched Q). Metal decode drops to path 2.
+		if vEncodeResult != nil && (!c.preferFusedAttn || useDequantKVForPrefill) {
 			key, value := c.compressedK.DequantKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells)
 			if key != nil && value != nil {
 				c.logPathOnce[1].Do(func() {
-					slog.Info("turboquant: using combined DequantKV + stock FA path")
+					if useDequantKVForPrefill {
+						slog.Info("turboquant: using combined DequantKV + stock FA path (Metal prefill)")
+					} else {
+						slog.Info("turboquant: using combined DequantKV + stock FA path")
+					}
 				})
 				_, _, mask := c.meta.Get(ctx)
 				c.armRotationForNextSDPA()
@@ -347,13 +372,13 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 		}
 
 		// 2. K+V fused inline-decode: reads packed K+V directly, no f16 intermediate.
-		//    Primary path on Metal (preferFusedAttn=true); fallback on CUDA/ROCm.
-		//    Only instantiated at D=128 — skip for larger head dims.
+		//    Primary path on Metal decode (Q=1); fallback on CUDA/ROCm.
+		//    Instantiated at D=128 always; D=256 on Metal only.
 		if vEncodeResult != nil && c.fusedFallbackEligible {
 			if tqkv, ok := c.compressedK.GetAsTQTensorKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells); ok {
 				c.logPathOnce[2].Do(func() {
 					if c.preferFusedAttn {
-						slog.Info("turboquant: using K+V fused inline-decode path (Metal: avoids f16 intermediate)")
+						slog.Info("turboquant: using K+V fused inline-decode path (Metal decode: avoids f16 intermediate)")
 					} else {
 						slog.Warn("turboquant: falling back to K+V inline-decode fused kernel (slower)")
 					}
@@ -364,8 +389,8 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 			}
 		}
 
-		// 1b. DequantKV fallback when fused path is preferred but unavailable
-		//     (e.g. headDim != 128, or GetAsTQTensorKV returned false on Metal).
+		// 1b. DequantKV fallback when Metal decode tried path 2 and the fused
+		//     path was unavailable (e.g. headDim outside 128/256).
 		if vEncodeResult != nil && c.preferFusedAttn {
 			key, value := c.compressedK.DequantKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells)
 			if key != nil && value != nil {
