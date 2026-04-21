@@ -10387,7 +10387,7 @@ kernel void kernel_tq_encode(
     threadgroup float    s_rot[128];
     threadgroup float    s_reduce[128];
     threadgroup uint8_t  s_idx[128];
-    threadgroup atomic_uint tg_packed[16];
+    threadgroup uint tg_packed[16];
 
     const int headDim    = args.headDim;
     const int numKVHeads = args.numKVHeads;
@@ -10468,7 +10468,7 @@ kernel void kernel_tq_encode(
     const uint8_t bitmask = (uint8_t)((1 << bits) - 1);
 
     for (uint i = tpitg; i < (uint)packed_words; i += ntpitg) {
-        atomic_store_explicit(&tg_packed[i], 0u, memory_order_relaxed);
+        atomic_store_explicit((threadgroup atomic_uint *)&tg_packed[i], 0u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -10477,18 +10477,18 @@ kernel void kernel_tq_encode(
         const uint byte_idx   = bit_offset >> 3;
         const uint shift      = bit_offset & 7;
         const uint v          = (uint)(s_idx[elem] & bitmask);
-        atomic_fetch_or_explicit(&tg_packed[byte_idx >> 2],
+        atomic_fetch_or_explicit((threadgroup atomic_uint *)&tg_packed[byte_idx >> 2],
             (v << shift) << ((byte_idx & 3) * 8), memory_order_relaxed);
         if (shift + (uint)bits > 8) {
             const uint byte_idx2 = byte_idx + 1;
-            atomic_fetch_or_explicit(&tg_packed[byte_idx2 >> 2],
+            atomic_fetch_or_explicit((threadgroup atomic_uint *)&tg_packed[byte_idx2 >> 2],
                 (v >> (8 - shift)) << ((byte_idx2 & 3) * 8), memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint i = tpitg; i < (uint)packed_words; i += ntpitg) {
-        out_words[i] = atomic_load_explicit(&tg_packed[i], memory_order_relaxed);
+        out_words[i] = atomic_load_explicit((threadgroup atomic_uint *)&tg_packed[i], memory_order_relaxed);
     }
 }
 
@@ -10517,7 +10517,7 @@ kernel void kernel_tq_encode_v(
     threadgroup float    s_rot[128];
     threadgroup float    s_reduce[128];
     threadgroup uint8_t  s_idx[128];
-    threadgroup atomic_uint tg_packed[16];
+    threadgroup uint tg_packed[16];
 
     const int headDim    = args.headDim;
     const int numKVHeads = args.numKVHeads;
@@ -10593,7 +10593,7 @@ kernel void kernel_tq_encode_v(
     const uint8_t bitmask = (uint8_t)((1 << bits) - 1);
 
     for (uint i = tpitg; i < (uint)packed_words; i += ntpitg) {
-        atomic_store_explicit(&tg_packed[i], 0u, memory_order_relaxed);
+        atomic_store_explicit((threadgroup atomic_uint *)&tg_packed[i], 0u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -10602,18 +10602,18 @@ kernel void kernel_tq_encode_v(
         const uint byte_idx   = bit_offset >> 3;
         const uint shift      = bit_offset & 7;
         const uint v          = (uint)(s_idx[elem] & bitmask);
-        atomic_fetch_or_explicit(&tg_packed[byte_idx >> 2],
+        atomic_fetch_or_explicit((threadgroup atomic_uint *)&tg_packed[byte_idx >> 2],
             (v << shift) << ((byte_idx & 3) * 8), memory_order_relaxed);
         if (shift + (uint)bits > 8) {
             const uint byte_idx2 = byte_idx + 1;
-            atomic_fetch_or_explicit(&tg_packed[byte_idx2 >> 2],
+            atomic_fetch_or_explicit((threadgroup atomic_uint *)&tg_packed[byte_idx2 >> 2],
                 (v >> (8 - shift)) << ((byte_idx2 & 3) * 8), memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint i = tpitg; i < (uint)packed_words; i += ntpitg) {
-        out_words[i] = atomic_load_explicit(&tg_packed[i], memory_order_relaxed);
+        out_words[i] = atomic_load_explicit((threadgroup atomic_uint *)&tg_packed[i], memory_order_relaxed);
     }
 }
 
@@ -10650,7 +10650,7 @@ kernel void kernel_tq_encode_outlier(
     threadgroup int      s_outl_pos[32];   // max outlierCount assumed ≤ 32
     threadgroup float    s_outl_val[32];
     threadgroup uint8_t  s_outl_idx[32];
-    threadgroup atomic_uint tg_packed[16];
+    threadgroup uint tg_packed[16];
 
     const int headDim      = args.headDim;
     const int numKVHeads   = args.numKVHeads;
@@ -10768,7 +10768,7 @@ kernel void kernel_tq_encode_outlier(
         device uint * reg_words = (device uint *)(packed_out + (long)slot * reg_packed_bytes);
         const uint8_t bitmask = (uint8_t)((1 << bits) - 1);
         for (uint i = tpitg; i < (uint)reg_packed_words; i += ntpitg) {
-            atomic_store_explicit(&tg_packed[i], 0u, memory_order_relaxed);
+            atomic_store_explicit((threadgroup atomic_uint *)&tg_packed[i], 0u, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int r = (int)tpitg; r < regularCount; r += (int)ntpitg) {
@@ -10776,17 +10776,17 @@ kernel void kernel_tq_encode_outlier(
             const uint byte_idx   = bit_offset >> 3;
             const uint shift      = bit_offset & 7;
             const uint v          = (uint)(s_idx[r] & bitmask);
-            atomic_fetch_or_explicit(&tg_packed[byte_idx >> 2],
+            atomic_fetch_or_explicit((threadgroup atomic_uint *)&tg_packed[byte_idx >> 2],
                 (v << shift) << ((byte_idx & 3) * 8), memory_order_relaxed);
             if (shift + (uint)bits > 8) {
                 const uint byte_idx2 = byte_idx + 1;
-                atomic_fetch_or_explicit(&tg_packed[byte_idx2 >> 2],
+                atomic_fetch_or_explicit((threadgroup atomic_uint *)&tg_packed[byte_idx2 >> 2],
                     (v >> (8 - shift)) << ((byte_idx2 & 3) * 8), memory_order_relaxed);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tpitg; i < (uint)reg_packed_words; i += ntpitg) {
-            reg_words[i] = atomic_load_explicit(&tg_packed[i], memory_order_relaxed);
+            reg_words[i] = atomic_load_explicit((threadgroup atomic_uint *)&tg_packed[i], memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -10810,7 +10810,7 @@ kernel void kernel_tq_encode_outlier(
         device uint * out_words = (device uint *)(outlier_packed + (long)slot * out_packed_bytes);
         const uint8_t obmask = (uint8_t)((1 << outlierBits) - 1);
         for (uint i = tpitg; i < (uint)out_packed_words; i += ntpitg) {
-            atomic_store_explicit(&tg_packed[i], 0u, memory_order_relaxed);
+            atomic_store_explicit((threadgroup atomic_uint *)&tg_packed[i], 0u, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int r = (int)tpitg; r < outlierCount; r += (int)ntpitg) {
@@ -10818,17 +10818,17 @@ kernel void kernel_tq_encode_outlier(
             const uint byte_idx   = bit_offset >> 3;
             const uint shift      = bit_offset & 7;
             const uint v          = (uint)(s_outl_idx[r] & obmask);
-            atomic_fetch_or_explicit(&tg_packed[byte_idx >> 2],
+            atomic_fetch_or_explicit((threadgroup atomic_uint *)&tg_packed[byte_idx >> 2],
                 (v << shift) << ((byte_idx & 3) * 8), memory_order_relaxed);
             if (shift + (uint)outlierBits > 8) {
                 const uint byte_idx2 = byte_idx + 1;
-                atomic_fetch_or_explicit(&tg_packed[byte_idx2 >> 2],
+                atomic_fetch_or_explicit((threadgroup atomic_uint *)&tg_packed[byte_idx2 >> 2],
                     (v >> (8 - shift)) << ((byte_idx2 & 3) * 8), memory_order_relaxed);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tpitg; i < (uint)out_packed_words; i += ntpitg) {
-            out_words[i] = atomic_load_explicit(&tg_packed[i], memory_order_relaxed);
+            out_words[i] = atomic_load_explicit((threadgroup atomic_uint *)&tg_packed[i], memory_order_relaxed);
         }
     }
 
