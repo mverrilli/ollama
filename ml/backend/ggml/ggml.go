@@ -752,14 +752,15 @@ func (b *Backend) scanTQDevices() TQDeviceScan {
 }
 
 // newTQContext creates a GGML context whose tensors are allocated in GPU
-// memory (CUDA or HIP). Used by the TQ compressed KV cache manager: TQ
-// encode/decode ops require their tensors (packed buffers, scales, codebook,
-// rotation matrix) to reside on the GPU regardless of which model layers are
-// on CPU vs GPU. TQ tensors always land on the first TQ-capable GPU — NVIDIA
-// Pascal (cc 6.0) or newer, or AMD RDNA1 (gfx1010) or newer — in the
-// scheduler. In a mixed rig, unsupported cards are skipped: older NVIDIA
-// would hit the compute-capability assert in tq-dequant.cu, and wave64 AMD
-// (Vega/CDNA) would silently corrupt through the HIP __shfl_sync shim.
+// memory (CUDA, HIP, or Metal). Used by the TQ compressed KV cache manager:
+// TQ encode/decode ops require their tensors (packed buffers, scales,
+// codebook, rotation matrix) to reside on the GPU regardless of which model
+// layers are on CPU vs GPU. TQ tensors always land on the first TQ-capable
+// GPU — NVIDIA Pascal (cc 6.0)+, AMD RDNA1 (gfx1010)+, or Apple Silicon
+// (Metal, always wave32) — in the scheduler. In a mixed rig, unsupported
+// cards are skipped: older NVIDIA would hit the compute-capability assert in
+// tq-dequant.cu, and wave64 AMD (Vega/CDNA) would silently corrupt through
+// the HIP __shfl_sync shim.
 func (b *Backend) newTQContext(n int) *Context {
 	var allocatedBuffers []C.ggml_backend_buffer_t
 	scan := b.scanTQDevices()

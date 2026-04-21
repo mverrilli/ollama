@@ -102,19 +102,19 @@ func (m *ggmlTQCompressedK) outlierPackedBytes() int {
 }
 
 func (b *Backend) NewTQCompressedKManager(headDim, numKVHeads, bits int, rotationSeed uint64, vBits, outlierBits, outlierCount int) ml.TQCompressedKManager {
-	// TurboQuant ops run on CUDA (NVIDIA Pascal+) or ROCm/HIP (AMD RDNA1+,
-	// gfx1010+). The gate is wave32: the kernels hard-code a 32-lane
-	// __shfl_sync for codebook lookup, and on a wave64 warp the HIP shim's
-	// __shfl(…, 32) sub-partitions into two 32-lane groups whose upper half
-	// has no codebook data — so Vega/GCN/CDNA would corrupt if admitted.
-	// Scan the scheduler buffer types, pick the first TQ-capable GPU, and
-	// warn clearly if there's no suitable device or if a mixed-architecture
-	// rig forces us to skip unsupported cards.
+	// TurboQuant ops run on CUDA (NVIDIA Pascal+), ROCm/HIP (AMD RDNA1+,
+	// gfx1010+), or Metal (Apple Silicon). The gate is wave32: the kernels
+	// hard-code a 32-lane shuffle for codebook lookup. On wave64 AMD (Vega/
+	// GCN/CDNA) the HIP shim's __shfl(…, 32) sub-partitions the 64-lane warp
+	// and the upper 32 lanes return garbage — those are rejected. Metal SIMD
+	// groups are always 32-wide on Apple Silicon, so Metal is unconditionally
+	// admitted. Scan the scheduler buffer types, pick the first TQ-capable
+	// GPU, and warn clearly if there's no suitable device.
 	scan := b.scanTQDevices()
 	if !scan.selectedOK {
 		if len(scan.Skipped) > 0 {
 			slog.Warn("turboquant: no TQ-capable GPU found; falling back to f16 KV cache. "+
-				"TurboQuant requires NVIDIA Pascal (cc 6.0+) or AMD RDNA1+ (gfx1010+, wave32).",
+				"TurboQuant requires NVIDIA Pascal (cc 6.0+), AMD RDNA1+ (gfx1010+, wave32), or Apple Silicon (Metal).",
 				"skipped_gpus", scan.Skipped)
 		} else {
 			slog.Warn("turboquant: no GPU backend available, falling back to f16 KV cache")
@@ -123,8 +123,8 @@ func (b *Backend) NewTQCompressedKManager(headDim, numKVHeads, bits int, rotatio
 	}
 	if len(scan.Skipped) > 0 {
 		slog.Warn("turboquant: skipping unsupported GPU(s); TQ tensors will be placed on the "+
-			"first wave32 device (NVIDIA Pascal+ or AMD RDNA1+). To silence this warning, "+
-			"hide the unsupported cards with CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES.",
+			"first wave32 device (NVIDIA Pascal+, AMD RDNA1+, or Apple Silicon). To silence "+
+			"this warning, hide the unsupported cards with CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES.",
 			"selected", scan.SelectedName+" (cc "+scan.SelectedCC+")",
 			"skipped", scan.Skipped)
 	}
