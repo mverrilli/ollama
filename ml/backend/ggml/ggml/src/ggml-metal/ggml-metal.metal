@@ -10277,11 +10277,12 @@ kernel void kernel_tq_dequant_outlier(
     device const uint8_t * out_indices   [[buffer(6)]],
     device const float   * out_codebook  [[buffer(7)]],
     device       uint16_t* output        [[buffer(8)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  tpitg [[thread_position_in_threadgroup]],
+    uint3 tgpig   [[threadgroup_position_in_grid]],
+    uint  tiisg   [[thread_index_in_simdgroup]],
+    uint3 tpitg_v  [[thread_position_in_threadgroup]],
     threadgroup int8_t * s_outl_slot [[threadgroup(0)]])
 {
+    const uint tpitg = tpitg_v.x;
     const int c    = (int)tgpig.x;
     const int h    = (int)tgpig.y;
     const int cell = args.firstCell + c;
