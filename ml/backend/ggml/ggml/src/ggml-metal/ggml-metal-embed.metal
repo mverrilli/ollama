@@ -13146,8 +13146,40 @@ kernel void kernel_tq_dequant(
 
     const int cb_mask = (1 << args.bits) - 1;
     // Load one codebook entry per lane; period ≤ 8 divides 32, so simd_shuffle is exact.
-    const float cb_lane = codebook[tiisg & cb_mask];
+    // Pre-multiply by the per-cell scale so the decode path drops 1 fmul per element.
+    const float scaled_cb_lane = codebook[tiisg & cb_mask] * scale;
 
+    // Fast path: when headDim is a multiple of 128 (=32 lanes × 4 elements per thread),
+    // each thread decodes 4 consecutive D-positions per iter and writes a single half4.
+    //   bits=2: 4 elems = 8 bits, always byte-aligned (shift0=0 since elem_base mod 4 == 0).
+    //   bits=3: 4 elems = 12 bits, shift0 ∈ {0,4}, always fits in a 16-bit window.
+    // A 16-bit window (2 packed bytes) suffices for both. The scalar fallback
+    // covers non-multiple-of-128 head dims.
+    if ((args.headDim & 127) == 0) {
+        const int iters = args.headDim >> 7;
+        for (int iter = 0; iter < iters; iter++) {
+            const int elem_base   = iter * 128 + (int)tiisg * 4;
+            const int bit_offset  = elem_base * args.bits;
+            const int byte_base   = bit_offset >> 3;
+            const int shift0      = bit_offset & 7;
+
+            uint w = (uint)cell_packed[byte_base];
+            if (args.bits == 3) {
+                w |= ((uint)cell_packed[byte_base + 1] << 8);
+            }
+
+            half4 v4;
+            v4[0] = half(simd_shuffle(scaled_cb_lane, (ushort)((w >>  shift0                 ) & cb_mask)));
+            v4[1] = half(simd_shuffle(scaled_cb_lane, (ushort)((w >> (shift0 +     args.bits)) & cb_mask)));
+            v4[2] = half(simd_shuffle(scaled_cb_lane, (ushort)((w >> (shift0 + 2 * args.bits)) & cb_mask)));
+            v4[3] = half(simd_shuffle(scaled_cb_lane, (ushort)((w >> (shift0 + 3 * args.bits)) & cb_mask)));
+
+            *((device half4 *)(cell_out + elem_base)) = v4;
+        }
+        return;
+    }
+
+    // Scalar fallback for head dims that aren't a multiple of 128.
     for (uint elem = tiisg; elem < (uint)args.headDim; elem += 32) {
         const int bit_offset = (int)elem * args.bits;
         const int byte_idx   = bit_offset >> 3;
@@ -13156,8 +13188,7 @@ kernel void kernel_tq_dequant(
         if (shift + args.bits > 8) {
             idx |= ((int)(cell_packed[byte_idx + 1] << (8 - shift))) & cb_mask;
         }
-        const float val = simd_shuffle(cb_lane, (ushort)idx) * scale;
-        cell_out[elem] = half(val);
+        cell_out[elem] = half(simd_shuffle(scaled_cb_lane, (ushort)idx));
     }
 }
 
