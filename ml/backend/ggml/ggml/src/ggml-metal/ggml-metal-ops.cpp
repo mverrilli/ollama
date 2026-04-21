@@ -4197,7 +4197,12 @@ int ggml_metal_op_tq_dequant(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
 
-    const int block_size = std::min(128, headDim);
+    // Outlier kernel uses a 128-thread TG: threadgroup barriers + atomics on
+    // s_mask require all threads. Non-outlier kernel uses a single simdgroup
+    // (32 threads): it only reads tiisg and has no barriers, so a larger TG
+    // just replicates work across idle simdgroups.
+    const int outlier_block_size    = 128;
+    const int nonoutlier_block_size = 32;
 
     if (outlierCount > 0 && outlierBits > 0 && outlierCount < headDim) {
         const int regular_count    = headDim - outlierCount;
@@ -4234,7 +4239,7 @@ int ggml_metal_op_tq_dequant(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_dst, 8);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, nCells, numKVHeads, 1, block_size, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, nCells, numKVHeads, 1, outlier_block_size, 1, 1);
         return 1;
     }
 
@@ -4259,7 +4264,7 @@ int ggml_metal_op_tq_dequant(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // codebook
     ggml_metal_encoder_set_buffer  (enc, bid_dst, 4);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, nCells, numKVHeads, 1, block_size, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nCells, numKVHeads, 1, nonoutlier_block_size, 1, 1);
     return 1;
 }
 
@@ -4283,7 +4288,9 @@ int ggml_metal_op_tq_dequant_kv(ggml_metal_op_t ctx, int idx) {
     const int k_codebook_len = (int)op->src[2]->ne[0];
     const int v_codebook_len = (int)op->src[5]->ne[0];
 
-    const int block_size = std::min(128, headDim);
+    // kernel_tq_dequant is single-simdgroup (uses only tiisg, no barriers,
+    // no atomics) — 32-thread TGs eliminate 4× redundant work vs 128-thread.
+    const int block_size = 32;
     const size_t plane_size = (size_t)headDim * numKVHeads * nCells;
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
