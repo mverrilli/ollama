@@ -568,86 +568,127 @@ static __global__ void tq_flash_attn_ext_vec(
                 __syncwarp();
             }
 
+            // ----------------------------------------------------------------
+            // Q-tile decode amortization (the prefill perf fix).
+            //
+            // The original kernel decoded K (and outliers) inside the `j`
+            // (ncols) loop, so each cell got decoded ncols × per Q-tile.
+            // Hoist the decode out of `j`: build a per-lane register cache
+            // of K values, then the `j` loop is a pure FMA against
+            // s_Q_fixed[j*D + d]. Same hoist for the outlier sub-stream.
+            //
+            // Storage:
+            //   k_lane[D/nthreads_KQ]      — regular-stream decoded K at strided d's
+            //   o_val_lane[outlier_count/nthreads_KQ_max] — outlier-stream decoded K
+            //   o_pos_lane[outlier_count/nthreads_KQ_max] — outlier head-dim positions
+            // ----------------------------------------------------------------
+
+            const uint8_t * packed_row = K_packed + (int64_t)cell_rel * nKVHeads * packedBytes;
+            const float     rms_scale  = in_range ? scales[cell_rel * nKVHeads] : 0.0f;
+
+            // Regular-stream decode: hoisted out of `j`.
+            constexpr int K_PER_LANE = D / nthreads_KQ;          // 16 for D=128, 8 for D=64, 32 for D=256
+            float k_lane[K_PER_LANE];
+            // Per-lane outlier-channel mask & rank-below-d, only meaningful
+            // when HAS_OUTLIERS. For the regular stream, k_lane[ki] holds the
+            // dequantized regular K at head-dim position d=tid_kq+ki*nthreads_KQ;
+            // when the position is itself an outlier, the entry is forced to 0
+            // so the unconditional FMA in the j-loop produces the correct
+            // (zero) contribution from regular-stream K.
+            if constexpr (HAS_OUTLIERS) {
+                #pragma unroll
+                for (int ki = 0; ki < K_PER_LANE; ++ki) {
+                    const int d = tid_kq + ki * nthreads_KQ;
+                    const bool is_outl = (bmap[d >> 5] >> (d & 31)) & 1u;
+                    int outl_below = 0;
+                    #pragma unroll
+                    for (int w = 0; w < (D + 31) / 32; ++w) {
+                        const int wbit = w * 32;
+                        if (wbit + 31 < d) {
+                            outl_below += __popc(bmap[w]);
+                        } else if (wbit < d) {
+                            const uint32_t mask = (d - wbit) < 32
+                                ? ((1u << (d - wbit)) - 1u) : ~0u;
+                            outl_below += __popc(bmap[w] & mask);
+                        }
+                    }
+                    const int r_raw = d - outl_below;
+                    const int r = is_outl ? 0 : r_raw;
+                    const float k_val = tq_decode_elem(
+                        packed_row, codebook, rms_scale, r, bits);
+                    k_lane[ki] = is_outl ? 0.0f : k_val;
+                }
+            } else {
+                #pragma unroll
+                for (int ki = 0; ki < K_PER_LANE; ++ki) {
+                    const int d = tid_kq + ki * nthreads_KQ;
+                    k_lane[ki] = tq_decode_elem(packed_row, codebook, rms_scale, d, bits);
+                }
+            }
+
+            // Outlier-stream decode: hoisted out of `j`. Each lane handles
+            // 32/nthreads_KQ outlier slots (outlier_count ≤ 32 by construction).
+            constexpr int O_PER_LANE = 32 / nthreads_KQ;         // 4 (assumes nthreads_KQ=8)
+            [[maybe_unused]] float o_val_lane[O_PER_LANE];
+            [[maybe_unused]] int   o_pos_lane[O_PER_LANE];
+            if constexpr (HAS_OUTLIERS) {
+                const uint8_t * o_packed_row = outlier_packed
+                    + (int64_t)cell_rel * nKVHeads * outlier_packedBytes;
+                const float o_rms = in_range
+                    ? outlier_scales[cell_rel * nKVHeads] : 0.0f;
+                const float * outlier_codebook_ptr = codebook + (1 << bits);
+                #pragma unroll
+                for (int s_it = 0; s_it < O_PER_LANE; ++s_it) {
+                    const int s = s_it * nthreads_KQ + tid_kq;
+                    const bool s_valid = (s < outlier_count);
+                    o_val_lane[s_it] = s_valid
+                        ? tq_decode_elem(o_packed_row, outlier_codebook_ptr,
+                                         o_rms, s, outlier_bits)
+                        : 0.0f;
+                    o_pos_lane[s_it] = (s_valid && in_range && o_idx_cell_saved)
+                        ? (int)o_idx_cell_saved[s] : 0;
+                }
+            }
+
+            // Per-cell scalars hoisted out of `j` too.
+            const float reg_zero_val = (HAS_OUTLIERS
+                ? (zeros && in_range ? zeros[cell_rel * nKVHeads] : 0.0f)
+                : (asymmetric && zeros && in_range ? zeros[cell_rel * nKVHeads] : 0.0f));
+            [[maybe_unused]] const float out_zero_val =
+                (HAS_OUTLIERS && outlier_zeros && in_range)
+                    ? outlier_zeros[cell_rel * nKVHeads] : 0.0f;
+            const float qjl_norm_val = (qjl_rows > 0 && qjl_norm && in_range)
+                ? qjl_norm[cell_rel * nKVHeads] : 0.0f;
+            const uint8_t * cell_qjl = (qjl_rows > 0 && qjl_packed)
+                ? qjl_packed + (int64_t)cell_rel * nKVHeads * qjl_packedBytes
+                : nullptr;
+
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum;
-                const uint8_t * packed_row = K_packed + (int64_t)cell_rel * nKVHeads * packedBytes;
-                const float     rms_scale  = in_range ? scales[cell_rel * nKVHeads] : 0.0f;
 
                 if constexpr (HAS_OUTLIERS) {
-                    // Regular stream: inline classification via bmap.
-                    // Each lane scans its stride of head-dim positions,
-                    // skips outliers, computes the regular slot r on the fly,
-                    // and accumulates q[d] * k[r].  No shared-memory LUT.
-                    // shuffle_Q_at uses __shfl_sync with full-warp mask; it
-                    // must be reached by all lanes every iteration regardless
-                    // of is_outl. Compute unconditionally, accumulate only
-                    // when the channel is non-outlier.
+                    // Regular stream: pure FMA with cached K decode.
                     float reg_sum = 0.0f;
-                    for (int d = tid_kq; d < D; d += nthreads_KQ) {
-                        const bool is_outl = (bmap[d >> 5] >> (d & 31)) & 1u;
-                        int outl_below = 0;
-#pragma unroll
-                        for (int w = 0; w < (D + 31) / 32; ++w) {
-                            const int wbit = w * 32;
-                            if (wbit + 31 < d) {
-                                outl_below += __popc(bmap[w]);
-                            } else if (wbit < d) {
-                                const uint32_t mask = (d - wbit) < 32
-                                    ? ((1u << (d - wbit)) - 1u) : ~0u;
-                                outl_below += __popc(bmap[w] & mask);
-                            }
-                        }
-                        const int r_raw = d - outl_below;
-                        const int r = is_outl ? 0 : r_raw;     // safe index when outlier
-                        const float k_val = tq_decode_elem(
-                            packed_row, codebook, rms_scale, r, bits);
-                        const float q = s_Q_fixed[j * D + d];
-                        if (!is_outl) {
-                            reg_sum += q * k_val;
-                        }
+                    #pragma unroll
+                    for (int ki = 0; ki < K_PER_LANE; ++ki) {
+                        const int d = tid_kq + ki * nthreads_KQ;
+                        reg_sum += s_Q_fixed[j * D + d] * k_lane[ki];
                     }
-                    sum = reg_sum;
-                    // Outlier stream: ≤32 slots parallelised 4 per lane across
-                    // an 8-lane group. Use tq_decode_elem on the concatenated
-                    // codebook for scalar-safe reads (avoids unconditional
-                    // byte_idx+1 read past the 4-byte-padded outlier_packed).
-                    const uint8_t * o_packed_row = outlier_packed
-                        + (int64_t)cell_rel * nKVHeads * outlier_packedBytes;
-                    const float o_rms = in_range
-                        ? outlier_scales[cell_rel * nKVHeads] : 0.0f;
+                    // Outlier stream: pure FMA with cached outlier decode.
                     float out_sum = 0.0f;
-                    // Outlier codebook lives at codebook[(1<<bits) ..] in the
-                    // concatenated shared layout.
-                    const float * outlier_codebook_ptr = codebook + (1 << bits);
-#pragma unroll
-                    for (int s_it = 0; s_it < 32 / nthreads_KQ; ++s_it) {
-                        const int s = s_it * nthreads_KQ + tid_kq;
-                        const bool s_valid = (s < outlier_count);
-                        // tq_decode_elem reads byte_idx[+1 iff shift+bits>8].
-                        // For outlier_bits=4 at s=31: bit_off=124, byte_idx=15,
-                        // shift=4, shift+bits=8 → no cross-byte read. Safe.
-                        // For outlier_bits=3 at s=31: bit_off=93, byte_idx=11,
-                        // shift=5, shift+bits=8 → no cross-byte read. Safe.
-                        const float o_val = s_valid
-                            ? tq_decode_elem(o_packed_row, outlier_codebook_ptr,
-                                             o_rms, s, outlier_bits)
-                            : 0.0f;
-                        const int pos = (s_valid && in_range && o_idx_cell_saved)
-                            ? (int)o_idx_cell_saved[s] : 0;
-                        out_sum += s_Q_fixed[j * D + pos] * o_val;
+                    #pragma unroll
+                    for (int s_it = 0; s_it < O_PER_LANE; ++s_it) {
+                        out_sum += s_Q_fixed[j * D + o_pos_lane[s_it]] * o_val_lane[s_it];
                     }
-                    sum = reg_sum + out_sum;  // unconditional warp_reduce_sum below covers it
+                    sum = reg_sum + out_sum;
                 } else {
-                    // Non-outlier path: stride loop to correctly pair Q[d] with K[d].
-                    // tq_vec_dot_KQ uses a register-tiled Q layout that misaligns Q and K
-                    // indices (Q[2*(8*kk+t)] is paired with K[8t+2*kk]). Using s_Q_fixed
-                    // and sequential decode guarantees the correct diagonal pairing.
-                    // rms_scale==0 for out-of-range cells so decode produces 0 safely.
+                    // Non-outlier path: pure FMA with cached K decode.
                     float reg_sum = 0.0f;
-                    for (int d = tid_kq; d < D; d += nthreads_KQ) {
-                        reg_sum += s_Q_fixed[j * D + d] *
-                                   tq_decode_elem(packed_row, codebook, rms_scale, d, bits);
+                    #pragma unroll
+                    for (int ki = 0; ki < K_PER_LANE; ++ki) {
+                        const int d = tid_kq + ki * nthreads_KQ;
+                        reg_sum += s_Q_fixed[j * D + d] * k_lane[ki];
                     }
                     sum = reg_sum;
                 }
@@ -658,31 +699,23 @@ static __global__ void tq_flash_attn_ext_vec(
                     // Dual-stream zeros: regular zero applies to Σ_{d∈reg} Q[d]
                     // = sum_q[j] − sum_q_outl[j]; outlier zero applies to sum_q_outl[j].
                     if (asymmetric && (zeros || outlier_zeros)) {
-                        const float reg_zero = (zeros && in_range)
-                            ? zeros[cell_rel * nKVHeads] : 0.0f;
-                        const float out_zero = (outlier_zeros && in_range)
-                            ? outlier_zeros[cell_rel * nKVHeads] : 0.0f;
-                        sum += reg_zero * (sum_q[j] - sum_q_outl[j])
-                             + out_zero * sum_q_outl[j];
+                        sum += reg_zero_val * (sum_q[j] - sum_q_outl[j])
+                             + out_zero_val * sum_q_outl[j];
                     }
                 } else if (asymmetric && zeros) {
-                    const float zero_val = in_range ? zeros[cell_rel * nKVHeads] : 0.0f;
-                    sum += zero_val * sum_q[j];
+                    sum += reg_zero_val * sum_q[j];
                 }
 
                 // QJL residual sketch: add norm * scale * Σ_i sign_i * dot_q[i] to the dot product.
                 if (qjl_rows > 0 && qjl_packed && qjl_norm) {
                     const float qjl_scale = 1.2533141373155001f / qjl_rows;
-                    const float norm = in_range ? qjl_norm[cell_rel * nKVHeads] : 0.0f;
-                    const uint8_t * cell_qjl = qjl_packed + (int64_t)cell_rel * nKVHeads * qjl_packedBytes;
-
                     float sign_dot = 0.0f;
                     for (int i = tid_kq; i < qjl_rows; i += nthreads_KQ) {
                         int sign = ((cell_qjl[i >> 3] >> (i & 7)) & 1) ? 1.0f : -1.0f;
                         sign_dot += (float)sign * s_dot_q_fixed[j * 256 + i];
                     }
                     sign_dot = warp_reduce_sum<nthreads_KQ>(sign_dot);
-                    sum += norm * qjl_scale * sign_dot;
+                    sum += qjl_norm_val * qjl_scale * sign_dot;
                 }
 
                 if (use_logit_softcap) {

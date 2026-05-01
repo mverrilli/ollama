@@ -168,6 +168,21 @@ static __global__ void q8k_flash_attn_ext_vec(
                 }
             }
 
+            // Q-tile decode amortization: hoist K decode out of the `j` loop
+            // so each cell's bytes are dequantized once and reused by every
+            // Q-token in the tile. k_lane[k] holds the float2 (k0, k1).
+            float2 k_lane[(D/2) / nthreads_KQ];
+            if (in_range) {
+#pragma unroll
+                for (int k = 0; k < (D/2) / nthreads_KQ; ++k) {
+                    const int d0 = 2 * (k * nthreads_KQ + tid_kq);
+                    const int g0 = d0 / Q8K_FA_GROUP_SIZE;
+                    const int g1 = (d0 + 1) / Q8K_FA_GROUP_SIZE;
+                    k_lane[k].x = (float)packed_row[d0]     * k_s[g0] + k_m[g0];
+                    k_lane[k].y = (float)packed_row[d0 + 1] * k_s[g1] + k_m[g1];
+                }
+            }
+
             // Q·K dot product: each of nthreads_KQ threads handles D/nthreads_KQ elements.
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
@@ -181,12 +196,7 @@ static __global__ void q8k_flash_attn_ext_vec(
                 if (in_range) {
 #pragma unroll
                     for (int k = 0; k < (D/2) / nthreads_KQ; ++k) {
-                        const int d0 = 2 * (k * nthreads_KQ + tid_kq);
-                        const int g0 = d0 / Q8K_FA_GROUP_SIZE;
-                        const int g1 = (d0 + 1) / Q8K_FA_GROUP_SIZE;
-                        const float k0 = (float)packed_row[d0]     * k_s[g0] + k_m[g0];
-                        const float k1 = (float)packed_row[d0 + 1] * k_s[g1] + k_m[g1];
-                        sum += Q_reg[j][k].x * k0 + Q_reg[j][k].y * k1;
+                        sum += Q_reg[j][k].x * k_lane[k].x + Q_reg[j][k].y * k_lane[k].y;
                     }
                 }
                 // Reduce across the nthreads_KQ lanes.

@@ -165,6 +165,22 @@ static __global__ void q4k_flash_attn_ext_vec(
                 }
             }
 
+            // Q-tile decode amortization: hoist K decode out of the `j` loop.
+            // d0 = 2*(k*nthreads_KQ + tid_kq) is always even, so elements d0
+            // and d0+1 share packed_row[d0/2] (low nibble = d0, high = d0+1).
+            float2 k_lane[(D/2) / nthreads_KQ];
+            if (in_range) {
+#pragma unroll
+                for (int k = 0; k < (D/2) / nthreads_KQ; ++k) {
+                    const int d0 = 2 * (k * nthreads_KQ + tid_kq);
+                    const int g0 = d0 / Q4K_FA_GROUP_SIZE;
+                    const int g1 = (d0 + 1) / Q4K_FA_GROUP_SIZE;
+                    const uint8_t b = packed_row[d0 / 2];
+                    k_lane[k].x = (float)(b & 0xF) * k_s[g0] + k_m[g0];
+                    k_lane[k].y = (float)(b >> 4)  * k_s[g1] + k_m[g1];
+                }
+            }
+
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float mask_val = 0.0f;
@@ -176,17 +192,7 @@ static __global__ void q4k_flash_attn_ext_vec(
                 if (in_range) {
 #pragma unroll
                     for (int k = 0; k < (D/2) / nthreads_KQ; ++k) {
-                        // d0 = 2*(k*nthreads_KQ + tid_kq) is always even.
-                        // Elements d0 and d0+1 share packed_row[d0/2]:
-                        //   low nibble  (bits 0-3) = element d0
-                        //   high nibble (bits 4-7) = element d0+1
-                        const int d0 = 2 * (k * nthreads_KQ + tid_kq);
-                        const int g0 = d0 / Q4K_FA_GROUP_SIZE;
-                        const int g1 = (d0 + 1) / Q4K_FA_GROUP_SIZE;
-                        const uint8_t b = packed_row[d0 / 2];
-                        const float k0 = (float)(b & 0xF) * k_s[g0] + k_m[g0];
-                        const float k1 = (float)(b >> 4)  * k_s[g1] + k_m[g1];
-                        sum += Q_reg[j][k].x * k0 + Q_reg[j][k].y * k1;
+                        sum += Q_reg[j][k].x * k_lane[k].x + Q_reg[j][k].y * k_lane[k].y;
                     }
                 }
                 for (int offset = nthreads_KQ / 2; offset > 0; offset >>= 1) {
