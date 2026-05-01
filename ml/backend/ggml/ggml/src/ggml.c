@@ -1048,9 +1048,27 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "TQ_ENCODE",
+    "TQ_DEQUANT",
+    "TQ_DEQUANT_KV",
+    "TQ_FLASH_ATTN_EXT",
+    "TQ_ENCODE_V",
+    "TQ_ENCODE_KV",
+    "Q8K_ENCODE",
+    "Q8K_DEQUANT",
+    "Q8K_FLASH_ATTN_EXT",
+    "Q4K_ENCODE",
+    "Q4K_DEQUANT",
+    "Q4K_FLASH_ATTN_EXT",
+    "SAW8K_ENCODE",
+    "SAW8K_DEQUANT",
+    "SAW8K_FLASH_ATTN_EXT",
+    "SAW4K_ENCODE",
+    "SAW4K_DEQUANT",
+    "SAW4K_FLASH_ATTN_EXT",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1157,9 +1175,26 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "tq_encode(k,rot,idx)->packed",
+    "tq_dequant(packed,scales)->f16",
+    "tq_flash_attn_ext(q,k_packed,v)->f32",
+    "tq_encode_v(v)->packed",
+    "tq_encode_kv(k,v)->packed",
+    "q8k_encode(k)->packed",
+    "q8k_dequant(packed,scales,mins)->f16",
+    "q8k_flash_attn_ext(q,kp,v)->dst",
+    "q4k_encode(k)->packed",
+    "q4k_dequant(packed,scales,mins)->f16",
+    "q4k_flash_attn_ext(q,kp,v)->dst",
+    "saw8k_encode(k,signs)->packed",
+    "saw8k_dequant(packed,scales,mins)->f16",
+    "saw8k_flash_attn_ext(q,kp,v,signs)->dst",
+    "saw4k_encode(k,signs)->packed",
+    "saw4k_dequant(packed,scales,mins)->f16",
+    "saw4k_flash_attn_ext(q,kp,v,signs)->dst",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7602,4 +7637,631 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->poll           != p1->poll       )    return false;
     if (p0->strict_cpu     != p1->strict_cpu )    return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
+}
+
+struct ggml_tensor * ggml_tq_encode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * rotation,
+        int32_t              firstCell,
+        struct ggml_tensor  * boundaries,
+        int32_t              bits,
+        struct ggml_tensor  * zeros,
+        struct ggml_tensor  * k_bias,
+        struct ggml_tensor  * codebook) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, packed);
+    result->op     = GGML_OP_TQ_ENCODE;
+    result->src[0] = k;
+    result->src[1] = rotation;
+    result->src[2] = zeros;      // NULL = symmetric; [numKVHeads, capacity] f32 for asymmetric
+    result->src[3] = scales;
+    result->src[4] = boundaries;
+    result->src[5] = k_bias;     // NULL = no bias subtraction; [numKVHeads*headDim] f32
+    result->src[6] = codebook;   // NULL = RMS only; [1<<bits] f32 enables EDEN biased scale
+    ggml_set_op_params_i32(result, 0, bits);
+    ggml_set_op_params_i32(result, 1, firstCell);
+    ggml_set_op_params_i32(result, 2, 0); // outlier_bits (0 = uniform)
+    ggml_set_op_params_i32(result, 3, 0); // outlier_count (0 = uniform)
+    ggml_set_op_params_i32(result, 4, zeros != NULL ? 1 : 0); // asymmetric flag
+    ggml_set_op_params_i32(result, 5, 0); // qjl_rows (0 = no QJL)
+    return result;
+}
+
+struct ggml_tensor * ggml_tq_dequant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * encode_result,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * codebook,
+        int headDim, int numKVHeads, int nCells, int firstCell, int bits) {
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                                                     headDim, numKVHeads, nCells);
+    result->op     = GGML_OP_TQ_DEQUANT;
+    result->src[0] = encode_result;
+    result->src[1] = scales;
+    result->src[2] = codebook;
+    ggml_set_op_params_i32(result, 0, (int32_t)bits);
+    ggml_set_op_params_i32(result, 1, (int32_t)firstCell);
+    ggml_set_op_params_i32(result, 2, 0); // outlier_bits (0 = uniform)
+    ggml_set_op_params_i32(result, 3, 0); // outlier_count (0 = uniform)
+    ggml_set_op_params_i32(result, 4, 0); // asymmetric (0 = symmetric) — kernel reads this unconditionally
+    ggml_set_op_params_i32(result, 5, 0); // qjl_rows (0 = no QJL) — ditto
+    return result;
+}
+
+// ggml_tq_encode_outlier: extends ggml_tq_encode with an outlier sub-block.
+// Same op (GGML_OP_TQ_ENCODE) with outlier_count > 0 in op_params[3]; the
+// CUDA backend dispatches to the outlier-aware kernel when it sees a non-zero
+// outlier_count in op_params. The regular packed buffer is the dst (view);
+// the outlier packed, scales, and indices are written as side effects via
+// src[5..8], same pattern as the regular scales src[3].
+struct ggml_tensor * ggml_tq_encode_outlier(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * rotation,
+        int32_t              firstCell,
+        struct ggml_tensor  * boundaries,
+        int32_t              bits,
+        struct ggml_tensor  * outlier_packed,
+        struct ggml_tensor  * outlier_scales,
+        struct ggml_tensor  * outlier_indices,
+        struct ggml_tensor  * outlier_boundaries,
+        int32_t              outlier_bits,
+        int32_t              outlier_count,
+        struct ggml_tensor  * zeros,
+        struct ggml_tensor  * outlier_zeros,
+        struct ggml_tensor  * qjl_packed,
+        struct ggml_tensor  * qjl_norm,
+        struct ggml_tensor  * qjl_projection,
+        int32_t              qjl_rows,
+        struct ggml_tensor  * codebook,
+        struct ggml_tensor  * outlier_codebook,
+        struct ggml_tensor  * k_bias) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, packed);
+    result->op     = GGML_OP_TQ_ENCODE;
+    result->src[0] = k;
+    result->src[1] = rotation;
+    result->src[2] = zeros;
+    result->src[3] = scales;
+    result->src[4] = boundaries;
+    result->src[5] = outlier_packed;
+    result->src[6] = outlier_scales;
+    result->src[7] = outlier_indices;
+    result->src[8] = outlier_boundaries;
+    result->src[9] = outlier_zeros;
+    result->src[10] = qjl_packed;
+    result->src[11] = qjl_norm;
+    result->src[12] = qjl_projection;
+    result->src[13] = codebook;
+    result->src[14] = outlier_codebook;
+    result->src[15] = k_bias;   // NULL = no bias subtraction; [numKVHeads*headDim] f32
+    ggml_set_op_params_i32(result, 0, bits);
+    ggml_set_op_params_i32(result, 1, firstCell);
+    ggml_set_op_params_i32(result, 2, outlier_bits);
+    ggml_set_op_params_i32(result, 3, outlier_count);
+    ggml_set_op_params_i32(result, 4, zeros ? 1 : 0);
+    ggml_set_op_params_i32(result, 5, qjl_rows);
+    return result;
+}
+
+// ggml_tq_dequant_outlier: extends ggml_tq_dequant with an outlier overwrite
+// pass. Reconstructs [headDim, numKVHeads, nCells] f16 by decoding the
+// regular sub-block for all 128 positions, then overwriting the outlier
+// channel positions from the outlier sub-block.
+struct ggml_tensor * ggml_tq_dequant_outlier(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * encode_result,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * codebook,
+        int headDim, int numKVHeads, int nCells, int firstCell, int bits,
+        struct ggml_tensor  * outlier_packed,
+        struct ggml_tensor  * outlier_scales,
+        struct ggml_tensor  * outlier_indices,
+        struct ggml_tensor  * outlier_codebook,
+        int32_t outlier_bits,
+        int32_t outlier_count,
+        struct ggml_tensor  * zeros,
+        struct ggml_tensor  * outlier_zeros,
+        struct ggml_tensor  * qjl_packed,
+        struct ggml_tensor  * qjl_norm,
+        struct ggml_tensor  * qjl_projection,
+        int32_t qjl_rows) {
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                                                     headDim, numKVHeads, nCells);
+    result->op     = GGML_OP_TQ_DEQUANT;
+    result->src[0] = encode_result;
+    result->src[1] = scales;
+    result->src[2] = codebook;
+    result->src[3] = outlier_packed;
+    result->src[4] = outlier_scales;
+    result->src[5] = outlier_indices;
+    result->src[6] = outlier_codebook;
+    result->src[7] = zeros;
+    result->src[8] = outlier_zeros;
+    result->src[9] = qjl_packed;
+    result->src[10] = qjl_norm;
+    result->src[11] = qjl_projection;
+    ggml_set_op_params_i32(result, 0, (int32_t)bits);
+    ggml_set_op_params_i32(result, 1, (int32_t)firstCell);
+    ggml_set_op_params_i32(result, 2, outlier_bits);
+    ggml_set_op_params_i32(result, 3, outlier_count);
+    ggml_set_op_params_i32(result, 4, zeros ? 1 : 0);
+    ggml_set_op_params_i32(result, 5, qjl_rows);
+    return result;
+}
+
+struct ggml_tensor * ggml_tq_dequant_kv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_encode_result,
+        struct ggml_tensor  * k_scales,
+        struct ggml_tensor  * k_codebook,
+        struct ggml_tensor  * v_encode_result,
+        struct ggml_tensor  * v_scales,
+        struct ggml_tensor  * v_codebook,
+        struct ggml_tensor  * v_rotation,
+        int headDim, int numKVHeads, int nCells, int firstCell,
+        int k_bits, int v_bits) {
+    // Output: [headDim, numKVHeads, nCells, 2] f16 — last dim separates K (0) and V (1).
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+                                                      headDim, numKVHeads, nCells, 2);
+    result->op     = GGML_OP_TQ_DEQUANT_KV;
+    result->src[0] = k_encode_result;
+    result->src[1] = k_scales;
+    result->src[2] = k_codebook;
+    result->src[3] = v_encode_result;
+    result->src[4] = v_scales;
+    result->src[5] = v_codebook;
+    result->src[6] = v_rotation;  // NULL = no rotation fusion
+    ggml_set_op_params_i32(result, 0, (int32_t)k_bits);
+    ggml_set_op_params_i32(result, 1, (int32_t)v_bits);
+    ggml_set_op_params_i32(result, 2, (int32_t)firstCell);
+    return result;
+}
+
+struct ggml_tensor * ggml_tq_flash_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_packed,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * codebook,
+        float scale, float logit_softcap,
+        int32_t bits, int32_t firstCell,
+        struct ggml_tensor  * v_scales,
+        struct ggml_tensor  * v_codebook,
+        int32_t v_bits,
+        struct ggml_tensor  * zeros,
+        struct ggml_tensor  * qjl_packed,
+        struct ggml_tensor  * qjl_norm,
+        struct ggml_tensor  * qjl_projection,
+        int32_t qjl_rows,
+        int32_t asymmetric,
+        struct ggml_tensor  * outlier_packed,
+        struct ggml_tensor  * outlier_scales,
+        struct ggml_tensor  * outlier_indices,
+        struct ggml_tensor  * outlier_zeros,
+        int32_t outlier_bits,
+        int32_t outlier_count,
+        int32_t outlier_packed_bytes) {
+    // Output: [D, nHeadsQ, nTokensQ, nSeq] f32 — same shape as standard flash_attn_ext.
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                                                     q->ne[0], q->ne[2], q->ne[1], q->ne[3]);
+    result->op     = GGML_OP_TQ_FLASH_ATTN_EXT;
+    result->src[0] = q;
+    result->src[1] = k_packed;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[4] = scales;
+    result->src[5] = codebook;
+    result->src[6] = v_scales;   // NULL → V is f16 (K-only fused); non-NULL → V is packed
+    result->src[7] = v_codebook; // NULL when V is f16
+    result->src[8] = zeros;      // NULL if symmetric
+    result->src[9] = qjl_packed; // NULL if no QJL
+    result->src[10] = qjl_norm;  // NULL if no QJL
+    result->src[11] = qjl_projection; // NULL if no QJL
+    result->src[12] = outlier_packed;   // NULL if no outliers
+    result->src[13] = outlier_scales;   // NULL if no outliers
+    result->src[14] = outlier_indices;  // NULL if no outliers
+    result->src[15] = outlier_zeros;    // NULL if no outliers or !asymmetric
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, logit_softcap);
+    ggml_set_op_params_i32(result, 2, bits);
+    ggml_set_op_params_i32(result, 3, firstCell);
+    ggml_set_op_params_i32(result, 4, v_bits);
+    ggml_set_op_params_i32(result, 5, qjl_rows);
+    ggml_set_op_params_i32(result, 6, asymmetric);
+    ggml_set_op_params_i32(result, 7, outlier_bits);
+    ggml_set_op_params_i32(result, 8, outlier_count);
+    ggml_set_op_params_i32(result, 9, outlier_packed_bytes);
+    return result;
+}
+
+struct ggml_tensor * ggml_tq_encode_v(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * rotation,
+        int32_t              firstCell,
+        struct ggml_tensor  * boundaries,
+        int32_t              bits,
+        struct ggml_tensor  * codebook) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, packed);
+    result->op     = GGML_OP_TQ_ENCODE_V;
+    result->src[0] = v;
+    result->src[1] = rotation; // NULL = no rotation, non-NULL = R^T matrix
+    result->src[2] = NULL;
+    result->src[3] = scales;
+    result->src[4] = boundaries;
+    result->src[5] = codebook;  // NULL = RMS; [1<<bits] f32 enables EDEN
+    ggml_set_op_params_i32(result, 0, bits);
+    ggml_set_op_params_i32(result, 1, firstCell);
+    return result;
+}
+
+struct ggml_tensor * ggml_tq_encode_kv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_packed,
+        struct ggml_tensor  * k_scales,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * rotation,
+        struct ggml_tensor  * k_boundaries,
+        struct ggml_tensor  * v_packed,
+        struct ggml_tensor  * v_scales,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * v_boundaries,
+        int32_t firstCell, int32_t k_bits, int32_t v_bits,
+        struct ggml_tensor  * k_bias,
+        struct ggml_tensor  * k_codebook,
+        struct ggml_tensor  * v_codebook) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, k_packed);
+    result->op     = GGML_OP_TQ_ENCODE_KV;
+    result->src[0] = k;
+    result->src[1] = rotation;
+    result->src[2] = v;
+    result->src[3] = k_scales;
+    result->src[4] = k_boundaries;
+    result->src[5] = v_packed;
+    result->src[6] = v_scales;
+    result->src[7] = v_boundaries;
+    result->src[8] = k_bias;        // NULL = no bias; [numKVHeads*headDim] f32
+    result->src[9] = k_codebook;    // NULL = RMS scale only; [1<<k_bits] f32 enables EDEN
+    result->src[10] = v_codebook;   // NULL = RMS scale only; [1<<v_bits] f32 enables EDEN
+    ggml_set_op_params_i32(result, 0, k_bits);
+    ggml_set_op_params_i32(result, 1, v_bits);
+    ggml_set_op_params_i32(result, 2, firstCell);
+    return result;
+}
+
+// ggml_q8k_encode: per-group asymmetric int8 encode, no rotation.
+// packed: [headDim * numKVHeads, capacity] u8   (dst, view returned)
+// scales: [(headDim/32) * numKVHeads, capacity] f16  (side-output via src[1])
+// mins:   [(headDim/32) * numKVHeads, capacity] f16  (side-output via src[2])
+// k:      [headDim, numKVHeads, batchSize] f16
+struct ggml_tensor * ggml_q8k_encode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * mins,
+        struct ggml_tensor  * k,
+        int32_t               firstCell) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, packed);
+    result->op     = GGML_OP_Q8K_ENCODE;
+    result->src[0] = k;
+    result->src[1] = scales;
+    result->src[2] = mins;
+    ggml_set_op_params_i32(result, 0, firstCell);
+    return result;
+}
+
+// ggml_q8k_dequant: decode packed int8 back to f16.
+// encode_result: view returned by ggml_q8k_encode (establishes ordering)
+// scales, mins: same tensors passed to ggml_q8k_encode
+// Returns [headDim, numKVHeads, nCells] f16.
+struct ggml_tensor * ggml_q8k_dequant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * encode_result,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * mins,
+        int                   headDim,
+        int                   numKVHeads,
+        int                   nCells,
+        int                   firstCell) {
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                                                     headDim, numKVHeads, nCells);
+    result->op     = GGML_OP_Q8K_DEQUANT;
+    result->src[0] = encode_result;
+    result->src[1] = scales;
+    result->src[2] = mins;
+    ggml_set_op_params_i32(result, 0, headDim);
+    ggml_set_op_params_i32(result, 1, numKVHeads);
+    ggml_set_op_params_i32(result, 2, nCells);
+    ggml_set_op_params_i32(result, 3, firstCell);
+    return result;
+}
+
+// ggml_q8k_flash_attn_ext: fused q8k K flash-attention (K decoded inline, V f16).
+// Q:        [D, nTokensQ, nHeadsQ, nSeq] f32
+// K_packed: view of packed K buffer (layout: [(cell*nKVH+h)*D+d] u8)
+// V:        [D, nCells, nKVHeads] f16
+// mask:     [nCells, nTokensQ] f16 or NULL
+// k_scales: [(c*nG*nKVH + h*nG + g)] f16
+// k_mins:   [same] f16
+// Returns [D, nHeadsQ, nTokensQ, nSeq] f32 — same layout as ggml_flash_attn_ext.
+struct ggml_tensor * ggml_q8k_flash_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * Q,
+        struct ggml_tensor  * K_packed,
+        struct ggml_tensor  * V,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * k_scales,
+        struct ggml_tensor  * k_mins,
+        float                 scale,
+        float                 logit_softcap,
+        int32_t               firstCell,
+        int32_t               nKVHeads,
+        int32_t               nCells) {
+    // permute(0, 2, 1, 3) — matches ggml_flash_attn_ext output layout
+    int64_t ne[4] = { V->ne[0], Q->ne[2], Q->ne[1], Q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op     = GGML_OP_Q8K_FLASH_ATTN_EXT;
+    result->src[0] = Q;
+    result->src[1] = K_packed;
+    result->src[2] = V;
+    result->src[3] = mask;
+    result->src[4] = k_scales;
+    result->src[5] = k_mins;
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, logit_softcap);
+    ggml_set_op_params_i32(result, 2, firstCell);
+    ggml_set_op_params_i32(result, 3, nKVHeads);
+    ggml_set_op_params_i32(result, 4, nCells);
+    return result;
+}
+
+// ggml_q4k_encode: per-group asymmetric int4 encode (nibble packing), no rotation.
+// packed: [headDim/2 * numKVHeads, capacity] u8  (2 nibbles per byte, LSB-first)
+// scales: [(headDim/32) * numKVHeads, capacity] f16
+// mins:   [(headDim/32) * numKVHeads, capacity] f16
+// k:      [headDim, numKVHeads, batchSize] f16
+struct ggml_tensor * ggml_q4k_encode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * mins,
+        struct ggml_tensor  * k,
+        int32_t               firstCell) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, packed);
+    result->op     = GGML_OP_Q4K_ENCODE;
+    result->src[0] = k;
+    result->src[1] = scales;
+    result->src[2] = mins;
+    ggml_set_op_params_i32(result, 0, firstCell);
+    return result;
+}
+
+// ggml_q4k_dequant: decode nibble-packed int4 back to f16.
+// encode_result: view returned by ggml_q4k_encode (establishes ordering)
+// scales, mins: same tensors passed to ggml_q4k_encode
+// Returns [headDim, numKVHeads, nCells] f16.
+struct ggml_tensor * ggml_q4k_dequant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * encode_result,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * mins,
+        int                   headDim,
+        int                   numKVHeads,
+        int                   nCells,
+        int                   firstCell) {
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                                                     headDim, numKVHeads, nCells);
+    result->op     = GGML_OP_Q4K_DEQUANT;
+    result->src[0] = encode_result;
+    result->src[1] = scales;
+    result->src[2] = mins;
+    ggml_set_op_params_i32(result, 0, headDim);
+    ggml_set_op_params_i32(result, 1, numKVHeads);
+    ggml_set_op_params_i32(result, 2, nCells);
+    ggml_set_op_params_i32(result, 3, firstCell);
+    return result;
+}
+
+// ggml_q4k_flash_attn_ext: fused q4k K flash-attention (K nibble-decoded inline, V f16).
+struct ggml_tensor * ggml_q4k_flash_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * Q,
+        struct ggml_tensor  * K_packed,
+        struct ggml_tensor  * V,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * k_scales,
+        struct ggml_tensor  * k_mins,
+        float                 scale,
+        float                 logit_softcap,
+        int32_t               firstCell,
+        int32_t               nKVHeads,
+        int32_t               nCells) {
+    int64_t ne[4] = { V->ne[0], Q->ne[2], Q->ne[1], Q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op     = GGML_OP_Q4K_FLASH_ATTN_EXT;
+    result->src[0] = Q;
+    result->src[1] = K_packed;
+    result->src[2] = V;
+    result->src[3] = mask;
+    result->src[4] = k_scales;
+    result->src[5] = k_mins;
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, logit_softcap);
+    ggml_set_op_params_i32(result, 2, firstCell);
+    ggml_set_op_params_i32(result, 3, nKVHeads);
+    ggml_set_op_params_i32(result, 4, nCells);
+    return result;
+}
+
+// SAW-INT8: per-group asymmetric int8 encode with FWHT rotation.
+// op_params: [firstCell, signLo_lo32, signLo_hi32, signHi_lo32, signHi_hi32]
+struct ggml_tensor * ggml_saw8k_encode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * mins,
+        struct ggml_tensor  * k,
+        int32_t               firstCell,
+        uint64_t              signLo,
+        uint64_t              signHi) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, packed);
+    result->op     = GGML_OP_SAW8K_ENCODE;
+    result->src[0] = k;
+    result->src[1] = scales;
+    result->src[2] = mins;
+    ggml_set_op_params_i32(result, 0, firstCell);
+    ggml_set_op_params_i32(result, 1, (int32_t)(signLo & 0xFFFFFFFFu));
+    ggml_set_op_params_i32(result, 2, (int32_t)(signLo >> 32));
+    ggml_set_op_params_i32(result, 3, (int32_t)(signHi & 0xFFFFFFFFu));
+    ggml_set_op_params_i32(result, 4, (int32_t)(signHi >> 32));
+    return result;
+}
+
+struct ggml_tensor * ggml_saw8k_dequant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * encode_result,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * mins,
+        int                   headDim,
+        int                   numKVHeads,
+        int                   nCells,
+        int                   firstCell) {
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                                                     headDim, numKVHeads, nCells);
+    result->op     = GGML_OP_SAW8K_DEQUANT;
+    result->src[0] = encode_result;
+    result->src[1] = scales;
+    result->src[2] = mins;
+    ggml_set_op_params_i32(result, 0, headDim);
+    ggml_set_op_params_i32(result, 1, numKVHeads);
+    ggml_set_op_params_i32(result, 2, nCells);
+    ggml_set_op_params_i32(result, 3, firstCell);
+    return result;
+}
+
+// op_params: [scale(f32), softcap(f32), firstCell, nKVHeads, nCells,
+//             signLo_lo32, signLo_hi32, signHi_lo32, signHi_hi32]
+struct ggml_tensor * ggml_saw8k_flash_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * Q,
+        struct ggml_tensor  * K_packed,
+        struct ggml_tensor  * V,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * k_scales,
+        struct ggml_tensor  * k_mins,
+        float                 scale,
+        float                 logit_softcap,
+        int32_t               firstCell,
+        int32_t               nKVHeads,
+        int32_t               nCells,
+        uint64_t              signLo,
+        uint64_t              signHi) {
+    int64_t ne[4] = { V->ne[0], Q->ne[2], Q->ne[1], Q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op     = GGML_OP_SAW8K_FLASH_ATTN_EXT;
+    result->src[0] = Q;
+    result->src[1] = K_packed;
+    result->src[2] = V;
+    result->src[3] = mask;
+    result->src[4] = k_scales;
+    result->src[5] = k_mins;
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, logit_softcap);
+    ggml_set_op_params_i32(result, 2, firstCell);
+    ggml_set_op_params_i32(result, 3, nKVHeads);
+    ggml_set_op_params_i32(result, 4, nCells);
+    ggml_set_op_params_i32(result, 5, (int32_t)(signLo & 0xFFFFFFFFu));
+    ggml_set_op_params_i32(result, 6, (int32_t)(signLo >> 32));
+    ggml_set_op_params_i32(result, 7, (int32_t)(signHi & 0xFFFFFFFFu));
+    ggml_set_op_params_i32(result, 8, (int32_t)(signHi >> 32));
+    return result;
+}
+
+// SAW-INT4: per-group asymmetric int4 encode with FWHT rotation.
+struct ggml_tensor * ggml_saw4k_encode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * mins,
+        struct ggml_tensor  * k,
+        int32_t               firstCell,
+        uint64_t              signLo,
+        uint64_t              signHi) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, packed);
+    result->op     = GGML_OP_SAW4K_ENCODE;
+    result->src[0] = k;
+    result->src[1] = scales;
+    result->src[2] = mins;
+    ggml_set_op_params_i32(result, 0, firstCell);
+    ggml_set_op_params_i32(result, 1, (int32_t)(signLo & 0xFFFFFFFFu));
+    ggml_set_op_params_i32(result, 2, (int32_t)(signLo >> 32));
+    ggml_set_op_params_i32(result, 3, (int32_t)(signHi & 0xFFFFFFFFu));
+    ggml_set_op_params_i32(result, 4, (int32_t)(signHi >> 32));
+    return result;
+}
+
+struct ggml_tensor * ggml_saw4k_dequant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * encode_result,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * mins,
+        int                   headDim,
+        int                   numKVHeads,
+        int                   nCells,
+        int                   firstCell) {
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                                                     headDim, numKVHeads, nCells);
+    result->op     = GGML_OP_SAW4K_DEQUANT;
+    result->src[0] = encode_result;
+    result->src[1] = scales;
+    result->src[2] = mins;
+    ggml_set_op_params_i32(result, 0, headDim);
+    ggml_set_op_params_i32(result, 1, numKVHeads);
+    ggml_set_op_params_i32(result, 2, nCells);
+    ggml_set_op_params_i32(result, 3, firstCell);
+    return result;
+}
+
+struct ggml_tensor * ggml_saw4k_flash_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * Q,
+        struct ggml_tensor  * K_packed,
+        struct ggml_tensor  * V,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * k_scales,
+        struct ggml_tensor  * k_mins,
+        float                 scale,
+        float                 logit_softcap,
+        int32_t               firstCell,
+        int32_t               nKVHeads,
+        int32_t               nCells,
+        uint64_t              signLo,
+        uint64_t              signHi) {
+    int64_t ne[4] = { V->ne[0], Q->ne[2], Q->ne[1], Q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op     = GGML_OP_SAW4K_FLASH_ATTN_EXT;
+    result->src[0] = Q;
+    result->src[1] = K_packed;
+    result->src[2] = V;
+    result->src[3] = mask;
+    result->src[4] = k_scales;
+    result->src[5] = k_mins;
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, logit_softcap);
+    ggml_set_op_params_i32(result, 2, firstCell);
+    ggml_set_op_params_i32(result, 3, nKVHeads);
+    ggml_set_op_params_i32(result, 4, nCells);
+    ggml_set_op_params_i32(result, 5, (int32_t)(signLo & 0xFFFFFFFFu));
+    ggml_set_op_params_i32(result, 6, (int32_t)(signLo >> 32));
+    ggml_set_op_params_i32(result, 7, (int32_t)(signHi & 0xFFFFFFFFu));
+    ggml_set_op_params_i32(result, 8, (int32_t)(signHi >> 32));
+    return result;
 }
