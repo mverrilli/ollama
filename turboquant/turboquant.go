@@ -40,6 +40,27 @@ const (
 	objectiveProduct
 )
 
+// QuantScheme identifies the high-level quantization algorithm for a preset.
+// The zero value (SchemeHouseholderLloydMax) is the TurboQuant rotation +
+// codebook path. Non-zero values select lighter-weight integer paths that
+// share the TurboQuantCache infrastructure but skip rotation and codebooks.
+type QuantScheme uint8
+
+const (
+	// SchemeHouseholderLloydMax: random Householder QR rotation followed by
+	// per-head Lloyd-Max scalar quantization. All tq* presets use this scheme.
+	SchemeHouseholderLloydMax QuantScheme = iota
+
+	// SchemeQ8K: per-group asymmetric int8, no rotation, group size 32.
+	// ~9 bits/element effective. Works on all models including Qwen2.5.
+	SchemeQ8K
+
+	// SchemeQ4K: per-group asymmetric int4 (nibble), no rotation, group size 32.
+	// ~5 bits/element effective. Not suitable for models with large K bias
+	// (e.g. Qwen2.5); safe for llama3.x and qwen3.
+	SchemeQ4K
+)
+
 type Preset struct {
 	ID             uint8
 	Name           string
@@ -54,6 +75,11 @@ type Preset struct {
 	// Decoding unconditionally adds Zero back. Targets models whose learned
 	// K bias produces a non-zero-mean rotated distribution (Qwen 2 family).
 	AsymmetricPrimary bool
+
+	// Scheme identifies which quantization algorithm this preset uses.
+	// Zero value (SchemeHouseholderLloydMax) is the TurboQuant path.
+	// SchemeQ8K and SchemeQ4K select the per-group integer paths.
+	Scheme QuantScheme
 }
 
 var (
@@ -139,6 +165,22 @@ var (
 
 	// tq4qa: full stack — asymmetric + outlier split + QJL at 4-bit K+V.
 	PresetTQ4QA = newAsymmetricPreset(29, "tq4qa", 4, 4, 1, 0x45c0ffee, 5, 32)
+
+	// q8k: per-group asymmetric int8 (group=32), K-only, no rotation.
+	// ~9 bits/element. Works on all models including Qwen2.5 (large K bias
+	// is safely representable with 256 levels and per-group scales).
+	PresetQ8K = newQ8KPreset(30, "q8k", 8, 0)
+
+	// q8kv: per-group asymmetric int8 (group=32), K+V, no rotation.
+	PresetQ8KV = newQ8KPreset(31, "q8kv", 8, 8)
+
+	// q4k: per-group asymmetric int4 (nibble, group=32), K-only, no rotation.
+	// ~5 bits/element. Not suitable for models with large K projection bias
+	// (Qwen2.5): use q8k instead for those.
+	PresetQ4K = newQ4KPreset(32, "q4k", 4, 0)
+
+	// q4kv: per-group asymmetric int4 (nibble, group=32), K+V, no rotation.
+	PresetQ4KV = newQ4KPreset(33, "q4kv", 4, 4)
 )
 
 func newPreset(id uint8, name string, keyBits int, valueBits int, qjlRowsDivisor int, seed uint64, outlierBits int, outlierCount int) Preset {
@@ -161,6 +203,29 @@ func newAsymmetricPreset(id uint8, name string, keyBits int, valueBits int, qjlR
 	p := newPreset(id, name, keyBits, valueBits, qjlRowsDivisor, seed, outlierBits, outlierCount)
 	p.AsymmetricPrimary = true
 	return p
+}
+
+// newQ8KPreset constructs a per-group int8 preset (SchemeQ8K). The rotation
+// seed and Lloyd-Max fields are zeroed — they are irrelevant for this scheme.
+func newQ8KPreset(id uint8, name string, keyBits, valueBits int) Preset {
+	return Preset{
+		ID:             id,
+		Name:           name,
+		KeyPrimaryBits: keyBits,
+		ValueBits:      valueBits,
+		Scheme:         SchemeQ8K,
+	}
+}
+
+// newQ4KPreset constructs a per-group int4 (nibble) preset (SchemeQ4K).
+func newQ4KPreset(id uint8, name string, keyBits, valueBits int) Preset {
+	return Preset{
+		ID:             id,
+		Name:           name,
+		KeyPrimaryBits: keyBits,
+		ValueBits:      valueBits,
+		Scheme:         SchemeQ4K,
+	}
 }
 
 func (p Preset) HasOutlierSplit() bool {
@@ -210,6 +275,14 @@ func PresetByName(name string) (Preset, error) {
 		return PresetTQ4KA, nil
 	case "tq4qa":
 		return PresetTQ4QA, nil
+	case "q8k":
+		return PresetQ8K, nil
+	case "q8kv":
+		return PresetQ8KV, nil
+	case "q4k":
+		return PresetQ4K, nil
+	case "q4kv":
+		return PresetQ4KV, nil
 	default:
 		return Preset{}, fmt.Errorf("unknown turboquant preset %q", name)
 	}

@@ -858,6 +858,7 @@ func (f GGML) SupportsKVCacheType(cacheType string) bool {
 		"tq3a", "tq3ka", "tq2a", "tq2ka",
 		"tq3qa", "tq2qa",
 		"tq4", "tq4k", "tq4a", "tq4ka", "tq4qa",
+		"q8k", "q8kv", "q4k", "q4kv",
 	}, cacheType)
 }
 
@@ -877,7 +878,7 @@ func (f GGML) KVCacheTypeIsQuantized(cacheType string) bool {
 // either FA or the standard attention path.
 func (f GGML) KVCacheTypeRequiresFlashAttention(cacheType string) bool {
 	switch cacheType {
-	case "tq2k", "tq3k", "tq4k":
+	case "tq2k", "tq3k", "tq4k", "q8k", "q4k":
 		return false
 	}
 	return f.KVCacheTypeIsQuantized(cacheType)

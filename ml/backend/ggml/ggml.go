@@ -1897,6 +1897,62 @@ func (t *Tensor) I4Q4Encode(ctx ml.Context, scales, mins, k ml.Tensor, firstCell
 	}
 }
 
+// Q8KFlashAttnExt creates a GGML_OP_Q8K_FLASH_ATTN_EXT graph node.
+// t = packed K view (encode result, establishes graph dependency)
+// Q, V = query [D, nQ, nQH, 1] f32 and value [D, nKVH, nCells] f16
+// kScales, kMins = [(headDim/32)*numKVHeads, capacity] f16
+func (t *Tensor) Q8KFlashAttnExt(ctx ml.Context, Q, V, mask, kScales, kMins ml.Tensor, scale, logitSoftcap float32, firstCell, nKVHeads, nCells int) ml.Tensor {
+	var maskT *C.struct_ggml_tensor
+	if mask != nil {
+		maskT = mask.(*Tensor).t
+	}
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_q8k_flash_attn_ext(
+			ctx.(*Context).ctx,
+			Q.(*Tensor).t,
+			t.t,
+			V.(*Tensor).t,
+			maskT,
+			kScales.(*Tensor).t,
+			kMins.(*Tensor).t,
+			C.float(scale),
+			C.float(logitSoftcap),
+			C.int32_t(firstCell),
+			C.int32_t(nKVHeads),
+			C.int32_t(nCells),
+		),
+	}
+}
+
+// Q4KFlashAttnExt creates a GGML_OP_Q4K_FLASH_ATTN_EXT graph node.
+// t = packed K view (encode result, establishes graph dependency)
+// Q, V = query [D, nQ, nQH, 1] f32 and value [D, nKVH, nCells] f16
+// kScales, kMins = [(headDim/32)*numKVHeads, capacity] f16
+func (t *Tensor) Q4KFlashAttnExt(ctx ml.Context, Q, V, mask, kScales, kMins ml.Tensor, scale, logitSoftcap float32, firstCell, nKVHeads, nCells int) ml.Tensor {
+	var maskT *C.struct_ggml_tensor
+	if mask != nil {
+		maskT = mask.(*Tensor).t
+	}
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_q4k_flash_attn_ext(
+			ctx.(*Context).ctx,
+			Q.(*Tensor).t,
+			t.t,
+			V.(*Tensor).t,
+			maskT,
+			kScales.(*Tensor).t,
+			kMins.(*Tensor).t,
+			C.float(scale),
+			C.float(logitSoftcap),
+			C.int32_t(firstCell),
+			C.int32_t(nKVHeads),
+			C.int32_t(nCells),
+		),
+	}
+}
+
 func (t *Tensor) SetInplace(ctx ml.Context, src ml.Tensor, nb1, nb2, nb3, offset int) ml.Tensor {
 	return &Tensor{
 		b: t.b,
@@ -2305,6 +2361,15 @@ func (t *Tensor) ScaledDotProductAttention(ctx ml.Context, key, value, mask, sin
 	if t.b.flashAttention == ml.FlashAttentionEnabled {
 		// TQ fused flash attention: check for tqTensor BEFORE permuting value,
 		// because the K+V fused path passes packed V directly (no permute needed).
+		if qk, ok := key.(*q8kTensor); ok {
+			// Per-group int8/int4 fused flash attention (q8k/q4k presets).
+			if sinks != nil || vmla != nil {
+				panic("ggml: q8k/q4k compressed K does not support sinks or vmla attention")
+			}
+			value = value.Permute(ctx, 0, 2, 1, 3)
+			return t.b.q8kFlashAttention(ctx, query.(*Tensor), qk, value.(*Tensor), mask, scale, 0)
+		}
+
 		if tqk, ok := key.(*tqTensor); ok {
 			if sinks != nil || vmla != nil {
 				panic("ggml: TQ compressed K does not support sinks or vmla attention")

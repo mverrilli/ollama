@@ -120,6 +120,14 @@ func kvCacheTypeFromStr(s string) ml.DType {
 		return ml.DTypeTQ4KA
 	case "tq4qa":
 		return ml.DTypeTQ4QA
+	case "q8k":
+		return ml.DTypeQ8K
+	case "q8kv":
+		return ml.DTypeQ8KV
+	case "q4k":
+		return ml.DTypeQ4K
+	case "q4kv":
+		return ml.DTypeQ4KV
 	default:
 		return ml.DTypeF16
 	}
