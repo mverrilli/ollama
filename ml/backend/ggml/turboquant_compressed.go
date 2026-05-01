@@ -215,6 +215,15 @@ func (b *Backend) NewTQCompressedKManager(headDim, numKVHeads, bits int, rotatio
 			"qjl_rows", qjlRows, "outlier_count", outlierCount)
 		return nil
 	}
+	// Metal's kernel_tq_encode_outlier returns early (leaving packed buffers
+	// undefined) when asymmetric primary or QJL is requested — the kernel
+	// only implements symmetric outlier-split. Route those presets to f16 so
+	// the output is correct rather than silent garbage.
+	if scan.SelectedLibrary == "Metal" && outlierCount > 0 && (asymmetricPrimary || qjlRows > 0) {
+		slog.Warn("turboquant: *qa presets (asymmetric+outlier or QJL) not yet implemented on Metal; falling back to f16 KV cache",
+			"asymmetric", asymmetricPrimary, "qjl_rows", qjlRows, "outlier_count", outlierCount)
+		return nil
+	}
 
 	if len(scan.Accepted) > 1 {
 		slog.Warn("turboquant: multi-GPU detected; TQ compressed buffers live on the "+

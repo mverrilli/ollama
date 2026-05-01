@@ -2871,8 +2871,9 @@ typedef struct {
     int32_t firstCell;
     int32_t kIsF32;       // 1 = f32 input, 0 = f16
     int32_t hasRotation;  // 1 = apply rotation matrix, 0 = skip
-    int32_t hasBias;      // 1 = subtract k_bias before rotation (K encode only)
-    int32_t hasCodebook;  // 1 = run EDEN biased-scale refinement after initial quant
+    int32_t hasBias;      // 1 = K projection bias present in src[bias_slot]
+    int32_t hasCodebook;  // 1 = Lloyd-Max codebook provided, 0 = uniform quantization
+    int32_t asymmetric;   // 1 = compute mean, subtract before quant, write to zeros_out
 } ggml_metal_kargs_tq_encode;
 
 typedef struct {
@@ -2886,7 +2887,7 @@ typedef struct {
     int32_t asymmetric;        // 1 = subtract mean before quant, store zero
     int32_t qjl_rows;          // 0 = no QJL residual sketch
     int32_t qjl_packed_bytes;  // padded: (qjl_rows + 7) / 8, aligned to 4
-    int32_t hasBias;           // 1 = subtract k_bias before rotation (buffer(17))
+    int32_t hasBias;           // 1 = K projection bias present in src[15]
 } ggml_metal_kargs_tq_encode_outlier;
 
 typedef struct {
@@ -2898,7 +2899,7 @@ typedef struct {
     int32_t  nKVHeads;
     int32_t  bits;        // K bits
     int32_t  firstCell;
-    int32_t  packedBytes; // K packed bytes per head (regular channels only when outlierCount>0)
+    int32_t  packedBytes; // K packed bytes per head
     int32_t  v_bits;      // 0 when V is f16
     int32_t  v_packedBytes;
     int32_t  hasMask;     // 1 = mask buffer valid
@@ -2912,12 +2913,13 @@ typedef struct {
     uint64_t nb22; // V stride: bytes between heads  (f16 path only)
     uint64_t nb23; // V stride: bytes between seqs   (f16 path only)
     uint64_t nb31; // mask stride: bytes between token rows
-    int32_t  asymmetric;       // 1 = add zeros correction to KQ dot product
-    int32_t  qjl_rows;         // 0 = no QJL residual sketch
-    int32_t  qjl_packedBytes;  // padded bytes per head for QJL sign bits
-    int32_t  outlierCount;     // 0 = no outlier split
-    int32_t  outlierBits;      // bits for outlier codebook
-    int32_t  outlierPackedBytes; // padded bytes per head for outlier packed
+    // *qa extension fields (asymmetric primary + outlier-split + QJL residual)
+    int32_t  asymmetric;          // 1 = asymmetric primary quantization
+    int32_t  qjl_rows;            // 0 = no QJL residual sketch
+    int32_t  qjl_packedBytes;     // padded: (qjl_rows + 7) / 8, aligned to 4
+    int32_t  outlierCount;        // 0 = no outlier-split
+    int32_t  outlierBits;         // bits per outlier index
+    int32_t  outlierPackedBytes;  // padded outlier packed bytes per cell-head
 } ggml_metal_kargs_tq_fattn_vec;
 
 #endif // GGML_METAL_IMPL
@@ -13335,6 +13337,7 @@ kernel void kernel_tq_encode(
     device const float   * boundaries [[buffer(5)]],
     device const float   * k_bias     [[buffer(6)]],
     device const float   * codebook   [[buffer(7)]],
+    device       float   * zeros_out  [[buffer(8)]],
     uint3 tgpig  [[threadgroup_position_in_grid]],
     uint3 tpitg_v [[thread_position_in_threadgroup]],
     uint3 ntpitg_v[[threads_per_threadgroup]])
@@ -13370,8 +13373,7 @@ kernel void kernel_tq_encode(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 1b: K-projection bias subtraction (Qwen2-class models).
-    // Subtract before rotation so Lloyd-Max codebook sees zero-mean data.
+    // Step 1b: Subtract K projection bias before rotation (e.g. Qwen2 attn_k.bias).
     if (args.hasBias) {
         const int bias_base = head * headDim;
         for (int d = (int)tpitg; d < headDim; d += (int)ntpitg) {
@@ -13393,6 +13395,32 @@ kernel void kernel_tq_encode(
     } else {
         for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
             s_rot[i] = s_k[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Step 2b: Asymmetric mean centering — subtract per-vector mean from s_rot,
+    //          write mean to zeros_out so the decode kernel can add it back.
+    if (args.asymmetric) {
+        float local_sum = 0.0f;
+        for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
+            local_sum += s_rot[i];
+        }
+        s_reduce[tpitg] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
+            if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tpitg == 0) {
+            const float mean_val = s_reduce[0] / (float)headDim;
+            zeros_out[cell * numKVHeads + head] = mean_val;
+            s_reduce[0] = mean_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float mean_val = s_reduce[0];
+        for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
+            s_rot[i] -= mean_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -13435,51 +13463,6 @@ kernel void kernel_tq_encode(
         s_idx[i] = (uint8_t)idx;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Step 4b: EDEN biased-scale refinement (two-pass MSE-optimal scale).
-    // S* = Σ(v[i]·c[s_idx[i]]) / Σ(c[s_idx[i]]²)
-    // Reuses s_k (dead after rotation) as a second reduction accumulator.
-    if (args.hasCodebook) {
-        threadgroup float * s_reduce2 = s_k; // alias dead buffer
-        for (int pass = 0; pass < 2; pass++) {
-            float local_num = 0.0f, local_den = 0.0f;
-            for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
-                float ci = codebook[(int)s_idx[i]];
-                local_num += s_rot[i] * ci;
-                local_den += ci * ci;
-            }
-            s_reduce[tpitg] = local_num;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-                if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            s_reduce2[tpitg] = local_den;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-                if (tpitg < stride) s_reduce2[tpitg] += s_reduce2[tpitg + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            const float eden_num = s_reduce[0];
-            const float eden_den = s_reduce2[0];
-            const float s_eden = (eden_den > 1e-12f && eden_num > 0.0f)
-                                 ? (eden_num / eden_den) : scale;
-            scale = s_eden;
-            if (tpitg == 0) scales_out[cell * numKVHeads + head] = scale;
-            if (pass == 0) {
-                // Re-quantize with updated scale so pass 1 uses the refined assignment.
-                for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
-                    float v = (scale > 0.0f) ? (s_rot[i] / scale) : 0.0f;
-                    int idx = 0;
-                    for (int b = 0; b < numBoundaries; b++) {
-                        if (v >= boundaries[b]) idx++;
-                    }
-                    s_idx[i] = (uint8_t)idx;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-    }
 
     // Step 5: Pack bits into output using threadgroup atomics.
     const int slot = cell * numKVHeads + head;
@@ -13524,7 +13507,6 @@ kernel void kernel_tq_encode_v(
     device       uint8_t * packed_out [[buffer(3)]],
     device       float   * scales_out [[buffer(4)]],
     device const float   * boundaries [[buffer(5)]],
-    device const float   * codebook   [[buffer(6)]],
     uint3 tgpig   [[threadgroup_position_in_grid]],
     uint3 tpitg_v  [[thread_position_in_threadgroup]],
     uint3 ntpitg_v [[threads_per_threadgroup]])
@@ -13610,48 +13592,6 @@ kernel void kernel_tq_encode_v(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // EDEN biased-scale refinement for V (reuses s_v as second reduction buffer).
-    if (args.hasCodebook) {
-        threadgroup float * s_reduce2 = s_v; // alias dead buffer
-        for (int pass = 0; pass < 2; pass++) {
-            float local_num = 0.0f, local_den = 0.0f;
-            for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
-                float ci = codebook[(int)s_idx[i]];
-                local_num += s_rot[i] * ci;
-                local_den += ci * ci;
-            }
-            s_reduce[tpitg] = local_num;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-                if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            s_reduce2[tpitg] = local_den;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-                if (tpitg < stride) s_reduce2[tpitg] += s_reduce2[tpitg + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            const float eden_num = s_reduce[0];
-            const float eden_den = s_reduce2[0];
-            const float s_eden = (eden_den > 1e-12f && eden_num > 0.0f)
-                                 ? (eden_num / eden_den) : scale;
-            scale = s_eden;
-            if (tpitg == 0) scales_out[cell * numKVHeads + head] = scale;
-            if (pass == 0) {
-                for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
-                    float v = (scale > 0.0f) ? (s_rot[i] / scale) : 0.0f;
-                    int idx = 0;
-                    for (int b = 0; b < numBoundaries; b++) {
-                        if (v >= boundaries[b]) idx++;
-                    }
-                    s_idx[i] = (uint8_t)idx;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-    }
-
     const int slot = cell * numKVHeads + head;
     device uint * out_words = (device uint *)(packed_out + (long)slot * packed_bytes);
     const uint8_t bitmask = (uint8_t)((1 << bits) - 1);
@@ -13683,7 +13623,6 @@ kernel void kernel_tq_encode_v(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // kernel_tq_encode_outlier  (K encode with outlier-split)
-// Supports asymmetric mean centering, EDEN biased scale, and QJL residual sketch.
 // Grid:  (batchSize, numKVHeads, 1)
 // Block: (block_size, 1, 1)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -13705,7 +13644,6 @@ kernel void kernel_tq_encode_outlier(
     device const float   * qjl_projection    [[buffer(14)]],
     device const float   * codebook          [[buffer(15)]],
     device const float   * outlier_codebook  [[buffer(16)]],
-    device const float   * k_bias            [[buffer(17)]],
     uint3 tgpig   [[threadgroup_position_in_grid]],
     uint3 tpitg_v  [[thread_position_in_threadgroup]],
     uint3 ntpitg_v [[threads_per_threadgroup]])
@@ -13716,7 +13654,15 @@ kernel void kernel_tq_encode_outlier(
     const int head  = (int)tgpig.y;
     const int cell  = args.firstCell + batch;
 
-    threadgroup float    s_k[128];      // also reused as s_reduce2 for EDEN (dead after Step 2)
+    // Asymmetric primary quantization and QJL residual sketch are not yet
+    // supported in the Metal encode kernel. The host fallback should have
+    // routed to f16 KV storage instead. Returning early leaves outputs
+    // undefined — this path should never be reached in normal operation.
+    if (args.asymmetric || args.qjl_rows > 0) {
+        return;
+    }
+
+    threadgroup float    s_k[128];
     threadgroup float    s_rot[128];
     threadgroup float    s_reduce[128];
     threadgroup uint8_t  s_idx[128];       // regular quantized indices
@@ -13733,20 +13679,14 @@ kernel void kernel_tq_encode_outlier(
     const int outlierBits  = args.outlierBits;
     const int outlierCount = args.outlierCount;
 
-    // Step 1: Load K, optionally subtracting k_bias before rotation.
-    const int base_k    = batch * numKVHeads * headDim + head * headDim;
-    const int bias_base = head * headDim;
+    // Step 1: Load K.
+    const int base_k = batch * numKVHeads * headDim + head * headDim;
     for (int d = (int)tpitg; d < headDim; d += (int)ntpitg) {
-        float val;
         if (args.kIsF32) {
-            val = ((device const float *)k_data)[base_k + d];
+            s_k[d] = ((device const float *)k_data)[base_k + d];
         } else {
-            val = float(((device const half *)k_data)[base_k + d]);
+            s_k[d] = float(((device const half *)k_data)[base_k + d]);
         }
-        if (args.hasBias) {
-            val -= k_bias[bias_base + d];
-        }
-        s_k[d] = val;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -13786,151 +13726,59 @@ kernel void kernel_tq_encode_outlier(
 
     const int regularCount = headDim - outlierCount;
 
-    // Step 4: Per-sub-block mean + RMS scale.
-    // For symmetric presets: mean=0, scale = sqrt(mean(v²)).
-    // For asymmetric presets: mean = avg(v), scale = sqrt(mean((v-mean)²)).
-    float local_sum_reg = 0.0f, local_sum_out = 0.0f;
-    float local_sq_reg  = 0.0f, local_sq_out  = 0.0f;
+    // Step 4: Per-sub-block RMS scales.
+    float local_sq_reg = 0.0f, local_sq_out = 0.0f;
     for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
         float v = s_rot[i];
-        if (s_is_outlier[i]) { local_sum_out += v; local_sq_out += v * v; }
-        else                  { local_sum_reg += v; local_sq_reg += v * v; }
+        float sq = v * v;
+        if (s_is_outlier[i]) local_sq_out += sq;
+        else                  local_sq_reg += sq;
     }
-
-    // Regular mean (async presets only).
-    float regMean = 0.0f;
-    if (args.asymmetric) {
-        s_reduce[tpitg] = local_sum_reg;
+    s_reduce[tpitg] = local_sq_reg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
+        if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-            if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tpitg == 0) {
-            regMean = (regularCount > 0) ? (s_reduce[0] / (float)regularCount) : 0.0f;
-            zeros_out[cell * numKVHeads + head] = regMean;
-            s_reduce[0] = regMean;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        regMean = s_reduce[0];
     }
-
-    // Regular scale.
     float regScale = 0.0f;
-    {
-        s_reduce[tpitg] = local_sq_reg;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-            if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tpitg == 0) {
-            float sum_sq = s_reduce[0];
-            if (args.asymmetric && regularCount > 0) {
-                float c_sq = sum_sq - (float)regularCount * regMean * regMean;
-                if (c_sq > 1e-12f) regScale = sqrt(c_sq / (float)regularCount);
-            } else if (sum_sq > 1e-12f && regularCount > 0) {
-                regScale = sqrt(sum_sq / (float)regularCount);
-            }
-            scales_out[cell * numKVHeads + head] = regScale;
-            s_reduce[0] = regScale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        regScale = s_reduce[0];
+    if (tpitg == 0) {
+        const float sum_sq = s_reduce[0];
+        if (sum_sq > 1e-12f && regularCount > 0)
+            regScale = sqrt(sum_sq / (float)regularCount);
+        scales_out[cell * numKVHeads + head] = regScale;
+        s_reduce[0] = regScale;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    regScale = s_reduce[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Outlier mean (asymmetric presets only).
-    float outMean = 0.0f;
-    if (args.asymmetric) {
-        s_reduce[tpitg] = local_sum_out;
+    s_reduce[tpitg] = local_sq_out;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
+        if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-            if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tpitg == 0) {
-            outMean = (outlierCount > 0) ? (s_reduce[0] / (float)outlierCount) : 0.0f;
-            outlier_zeros_out[cell * numKVHeads + head] = outMean;
-            s_reduce[0] = outMean;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        outMean = s_reduce[0];
     }
-
-    // Outlier scale.
     float outScale = 0.0f;
-    {
-        s_reduce[tpitg] = local_sq_out;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-            if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tpitg == 0) {
-            float sum_sq = s_reduce[0];
-            if (args.asymmetric && outlierCount > 0) {
-                float c_sq = sum_sq - (float)outlierCount * outMean * outMean;
-                if (c_sq > 1e-12f) outScale = sqrt(c_sq / (float)outlierCount);
-            } else if (sum_sq > 1e-12f && outlierCount > 0) {
-                outScale = sqrt(sum_sq / (float)outlierCount);
-            }
-            outlier_scales[cell * numKVHeads + head] = outScale;
-            s_reduce[0] = outScale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        outScale = s_reduce[0];
+    if (tpitg == 0) {
+        const float sum_sq = s_reduce[0];
+        if (sum_sq > 1e-12f && outlierCount > 0)
+            outScale = sqrt(sum_sq / (float)outlierCount);
+        outlier_scales[cell * numKVHeads + head] = outScale;
+        s_reduce[0] = outScale;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    outScale = s_reduce[0];
 
-    // Step 5: Quantize regular channels (centred by regMean for asymmetric).
+    // Step 5: Quantize regular channels.
     const int numBoundaries = (1 << bits) - 1;
     for (int r = (int)tpitg; r < regularCount; r += (int)ntpitg) {
         const int orig = s_reg_pos[r];
-        float v = (regScale > 0.0f) ? ((s_rot[orig] - regMean) / regScale) : 0.0f;
+        float v = (regScale > 0.0f) ? (s_rot[orig] / regScale) : 0.0f;
         int idx = 0;
         for (int b = 0; b < numBoundaries; b++) { if (v >= boundaries[b]) idx++; }
         s_idx[r] = (uint8_t)idx;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // EDEN biased-scale refinement for regular channels (two-pass, codebook != null means enabled).
-    // Reuses s_k as second reduction buffer — s_k is dead after Step 2.
-    if (codebook != nullptr) {
-        threadgroup float * s_reduce2 = s_k;
-        for (int pass = 0; pass < 2; pass++) {
-            float local_num = 0.0f, local_den = 0.0f;
-            for (int r = (int)tpitg; r < regularCount; r += (int)ntpitg) {
-                float ci = codebook[(int)s_idx[r]];
-                float vi = s_rot[s_reg_pos[r]] - regMean;
-                local_num += vi * ci;
-                local_den += ci * ci;
-            }
-            s_reduce[tpitg] = local_num;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-                if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            s_reduce2[tpitg] = local_den;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-                if (tpitg < stride) s_reduce2[tpitg] += s_reduce2[tpitg + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            float s_eden = (s_reduce2[0] > 1e-12f && s_reduce[0] > 0.0f)
-                ? (s_reduce[0] / s_reduce2[0]) : regScale;
-            regScale = s_eden;
-            if (tpitg == 0) scales_out[cell * numKVHeads + head] = regScale;
-            if (pass == 0) {
-                for (int r = (int)tpitg; r < regularCount; r += (int)ntpitg) {
-                    float v = (regScale > 0.0f) ? ((s_rot[s_reg_pos[r]] - regMean) / regScale) : 0.0f;
-                    int idx = 0;
-                    for (int b = 0; b < numBoundaries; b++) { if (v >= boundaries[b]) idx++; }
-                    s_idx[r] = (uint8_t)idx;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-    }
 
     // Step 6: Pack regular bits.
     const int reg_packed_raw   = (regularCount * bits + 7) / 8;
@@ -13964,54 +13812,15 @@ kernel void kernel_tq_encode_outlier(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 7: Quantize outlier channels (centred by outMean for asymmetric).
+    // Step 7: Quantize outlier channels.
     const int numOutlierBoundaries = (1 << outlierBits) - 1;
     for (int r = (int)tpitg; r < outlierCount; r += (int)ntpitg) {
-        float v = (outScale > 0.0f) ? ((s_outl_val[r] - outMean) / outScale) : 0.0f;
+        float v = (outScale > 0.0f) ? (s_outl_val[r] / outScale) : 0.0f;
         int idx = 0;
         for (int b = 0; b < numOutlierBoundaries; b++) { if (v >= outlier_boundaries[b]) idx++; }
         s_outl_idx[r] = (uint8_t)idx;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // EDEN biased-scale refinement for outlier channels (two-pass).
-    if (outlier_codebook != nullptr) {
-        threadgroup float * s_reduce2 = s_k;
-        for (int pass = 0; pass < 2; pass++) {
-            float local_num = 0.0f, local_den = 0.0f;
-            for (int r = (int)tpitg; r < outlierCount; r += (int)ntpitg) {
-                float ci = outlier_codebook[(int)s_outl_idx[r]];
-                float vi = s_outl_val[r] - outMean;
-                local_num += vi * ci;
-                local_den += ci * ci;
-            }
-            s_reduce[tpitg] = local_num;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-                if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            s_reduce2[tpitg] = local_den;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-                if (tpitg < stride) s_reduce2[tpitg] += s_reduce2[tpitg + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            float s_eden = (s_reduce2[0] > 1e-12f && s_reduce[0] > 0.0f)
-                ? (s_reduce[0] / s_reduce2[0]) : outScale;
-            outScale = s_eden;
-            if (tpitg == 0) outlier_scales[cell * numKVHeads + head] = outScale;
-            if (pass == 0) {
-                for (int r = (int)tpitg; r < outlierCount; r += (int)ntpitg) {
-                    float v = (outScale > 0.0f) ? ((s_outl_val[r] - outMean) / outScale) : 0.0f;
-                    int idx = 0;
-                    for (int b = 0; b < numOutlierBoundaries; b++) { if (v >= outlier_boundaries[b]) idx++; }
-                    s_outl_idx[r] = (uint8_t)idx;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-    }
 
     // Step 8: Pack outlier bits.
     const int out_packed_raw   = (outlierCount * outlierBits + 7) / 8;
@@ -14052,75 +13861,6 @@ kernel void kernel_tq_encode_outlier(
             idx_out[r] = (uint8_t)s_outl_pos[r];
         }
     }
-
-    // Step 11: QJL residual sketch (optional — only when qjl_rows > 0).
-    // Reconstruct → residual → L2 norm → projection sign bits.
-    if (args.qjl_rows > 0 && qjl_packed_out != nullptr && qjl_norm_out != nullptr) {
-        // Reconstruct into s_k (dead after Step 2, safe to reuse).
-        threadgroup float * s_recon = s_k;
-        for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) { s_recon[i] = 0.0f; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Regular channels.
-        for (int r = (int)tpitg; r < regularCount; r += (int)ntpitg) {
-            int orig = s_reg_pos[r];
-            float recon = (regScale > 0.0f) ? (codebook[s_idx[r]] * regScale + regMean) : regMean;
-            s_recon[orig] = recon;
-        }
-        // Outlier channels.
-        for (int r = (int)tpitg; r < outlierCount; r += (int)ntpitg) {
-            int orig = s_outl_pos[r];
-            float recon = (outScale > 0.0f) ? (outlier_codebook[s_outl_idx[r]] * outScale + outMean) : outMean;
-            s_recon[orig] = recon;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Residual = rotated - reconstructed; accumulate L2 norm.
-        float local_l2 = 0.0f;
-        for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
-            float diff = s_rot[i] - s_recon[i];
-            s_recon[i] = diff;
-            local_l2 += diff * diff;
-        }
-        s_reduce[tpitg] = local_l2;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
-            if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float residualNorm = 0.0f;
-        if (tpitg == 0) {
-            residualNorm = sqrt(s_reduce[0]);
-            qjl_norm_out[cell * numKVHeads + head] = residualNorm;
-            s_reduce[0] = residualNorm;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        residualNorm = s_reduce[0];
-
-        // Project residual onto Gaussian rows; store sign bits.
-        const int qjl_rows = args.qjl_rows;
-        const int slot     = cell * numKVHeads + head;
-        device uint8_t * qjl_cell = qjl_packed_out + (long)slot * args.qjl_packed_bytes;
-        if (residualNorm > 1e-12f) {
-            for (int row = (int)tpitg; row < qjl_rows; row += (int)ntpitg) {
-                float dot = 0.0f;
-                device const float * proj_row = qjl_projection + row * headDim;
-                for (int col = 0; col < headDim; col++) {
-                    dot += s_recon[col] * proj_row[col];
-                }
-                if (dot >= 0.0f) {
-                    const int byte_idx = row >> 3;
-                    const uint8_t mask = (uint8_t)(1u << (row & 7));
-                    // Safe atomicOr: qjl_packed_bytes is 4-byte aligned.
-                    atomic_fetch_or_explicit(
-                        (device atomic_uint *)(qjl_cell + (byte_idx & ~3)),
-                        (uint)mask << ((byte_idx & 3) * 8), memory_order_relaxed);
-                }
-            }
-        } else if (tpitg == 0) {
-            for (int p = 0; p < args.qjl_packed_bytes; p++) { qjl_cell[p] = 0; }
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -14148,7 +13888,7 @@ static inline void tq_decode_8_shfl(
         out[6] = simd_shuffle(cb_lane, (ushort)((w >> 18) & 7)) * rms;
         out[7] = simd_shuffle(cb_lane, (ushort)((w >> 21) & 7)) * rms;
     } else if (bits == 4) {
-        // 4-bit: 2 elements per byte (low nibble first), 8 elements = 4 bytes
+        // 4-bit: 2 nibbles per byte → 4 bytes for 8 elements.
         const int byte_off = start_elem >> 1;
         const uint w = (uint)packed_row[byte_off]
                      | ((uint)packed_row[byte_off + 1] << 8)
@@ -14163,7 +13903,7 @@ static inline void tq_decode_8_shfl(
         out[6] = simd_shuffle(cb_lane, (ushort)((w >> 24) & 0xF)) * rms;
         out[7] = simd_shuffle(cb_lane, (ushort)((w >> 28) & 0xF)) * rms;
     } else {
-        // bits == 2: 4 elements per byte
+        // 2-bit: 4 elements per byte → 2 bytes for 8 elements.
         const int byte_off = start_elem >> 2;
         const uint w = (uint)packed_row[byte_off] | ((uint)packed_row[byte_off + 1] << 8);
         out[0] = simd_shuffle(cb_lane, (ushort)((w >>  0) & 3)) * rms;
@@ -14187,32 +13927,22 @@ static inline float warp_reduce_sum8(float x, uint tiisg) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // kernel_tq_fattn_vec_f16
-// TQ fused flash-attention: K packed TQ, V f16.
-// Supports asymmetric mean correction, QJL sketch, and outlier-split decode.
-// Non-*qa paths (args.asymmetric==0 && args.qjl_rows==0 && args.outlierCount==0)
-// take the fast code path with no runtime overhead from the *qa extension.
+// TQ fused flash-attention: K packed i8, V f16.
 // Grid:  (ntiles_x, 1, nHeadsQ*nSeq)
 // Block: (32, 4, 1) = 128 threads
 // ─────────────────────────────────────────────────────────────────────────────
 kernel void kernel_tq_fattn_vec_f16(
     constant   ggml_metal_kargs_tq_fattn_vec & args,
-    device const char    * Q_data         [[buffer(1)]],
-    device const uint8_t * K_packed       [[buffer(2)]],
-    device const half    * V_data         [[buffer(3)]],
-    device const half    * mask_data      [[buffer(4)]],
-    device const float   * K_scales       [[buffer(5)]],
-    device const float   * K_cb           [[buffer(6)]],
-    device const float   * dummy_vs       [[buffer(7)]],
-    device const float   * dummy_vc       [[buffer(8)]],
-    device       float   * dst            [[buffer(9)]],
-    device const float   * zeros          [[buffer(10)]],
-    device const uint8_t * qjl_packed     [[buffer(11)]],
-    device const float   * qjl_norm       [[buffer(12)]],
-    device const float   * qjl_projection [[buffer(13)]],
-    device const uint8_t * outl_packed    [[buffer(14)]],
-    device const float   * outl_scales    [[buffer(15)]],
-    device const uint8_t * outl_indices   [[buffer(16)]],
-    device const float   * outl_zeros     [[buffer(17)]],
+    device const char    * Q_data    [[buffer(1)]],
+    device const uint8_t * K_packed  [[buffer(2)]],
+    device const half    * V_data    [[buffer(3)]],
+    device const half    * mask_data [[buffer(4)]],
+    device const float   * K_scales  [[buffer(5)]],
+    device const float   * K_cb      [[buffer(6)]],
+    device const float   * dummy_vs  [[buffer(7)]],
+    device const float   * dummy_vc  [[buffer(8)]],
+    device       float   * dst       [[buffer(9)]],
+    device const float   * K_zeros   [[buffer(10)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint  tiisg [[thread_index_in_simdgroup]],
     uint  sgitg [[simdgroup_index_in_threadgroup]])
@@ -14247,6 +13977,9 @@ kernel void kernel_tq_fattn_vec_f16(
         + (long)head_kv * args.packedBytes;
     device const float * K_sc = K_scales
         + (long)args.firstCell * args.nKVHeads + head_kv;
+    device const float * K_zr = args.asymmetric
+        ? (K_zeros + (long)args.firstCell * args.nKVHeads + head_kv)
+        : nullptr;
 
     // Advance V pointer.
     device const half * V = V_data
@@ -14281,6 +14014,22 @@ kernel void kernel_tq_fattn_vec_f16(
     }
 
     // Accumulators.
+    // Precompute sum_q[j] = Σ_e scaled_Q[j][e] for asymmetric zero correction.
+    float sum_q[2] = { 0.0f, 0.0f };
+    if (args.asymmetric) {
+        for (int j = 0; j < args.ncols; j++) {
+            float local_sum = 0.0f;
+            for (int k = 0; k < D/(2*nthreads_KQ); k++) {
+                local_sum += Q_reg[j][k].x + Q_reg[j][k].y;
+            }
+            // Reduce within KQ group (same 8 threads share same Q elements).
+            local_sum += simd_shuffle_xor(local_sum, 4);
+            local_sum += simd_shuffle_xor(local_sum, 2);
+            local_sum += simd_shuffle_xor(local_sum, 1);
+            sum_q[j] = local_sum;
+        }
+    }
+
     float2 VKQ[2][8];
     for (int j = 0; j < 2; j++)
         for (int i = 0; i < 8; i++)
@@ -14290,49 +14039,9 @@ kernel void kernel_tq_fattn_vec_f16(
     float KQ_sum[2] = { 0.0f, 0.0f };
 
     // Shared memory: KQ[2048], KQ_max_tg[2][32], KQ_sum_tg[2][32].
-    // *qa extension adds Q_all[2][128] (Q values for all D elements, pre-scaled)
-    // and qjl_dot[2][128] (per-query QJL dot products).
     threadgroup float KQ_tg[2048];
     threadgroup float KQ_max_tg[2][32];
     threadgroup float KQ_sum_tg[2][32];
-    threadgroup float Q_all[2][128];     // Q_all[j][d] = Q[j][d] * scale (pre-loaded for *qa)
-    threadgroup float qjl_dot[2][128];  // qjl_dot[j][row] = Σ_d Q_all[j][d]*G[row,d]
-
-    // Precompute Q_all from Q_reg (needed for asymmetric zero / QJL / outlier *qa paths).
-    // Each thread writes its slice of D elements.
-    if (args.asymmetric || args.qjl_rows > 0 || args.outlierCount > 0) {
-        for (int j = 0; j < args.ncols; j++) {
-            for (int k = 0; k < 8; k++) {
-                const int d0 = tid_kq * 16 + k * 2;
-                const int d1 = d0 + 1;
-                Q_all[j][d0] = Q_reg[j][k].x;
-                Q_all[j][d1] = Q_reg[j][k].y;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Precompute QJL dot products: qjl_dot[j][row] = Σ_d Q_all[j][d] * qjl_projection[row*D+d].
-        if (args.qjl_rows > 0) {
-            for (int j = 0; j < args.ncols; j++) {
-                // Distribute qjl_rows across all 128 threads (tid = sgitg*32 + tiisg).
-                for (int row = (int)tid; row < args.qjl_rows; row += nthreads) {
-                    float dot = 0.0f;
-                    device const float * proj_row = qjl_projection + row * D;
-                    for (int d = 0; d < D; d++) {
-                        dot += Q_all[j][d] * proj_row[d];
-                    }
-                    qjl_dot[j][row] = dot;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    // Outlier codebook: K_cb covers the regular (1<<bits) entries; the outlier
-    // codebook (1<<outlierBits entries) comes from the concatenated K_cb buffer
-    // at offset (1<<bits). The outlier lane mask mirrors the regular mask.
-    const int k_outl_cb_mask = args.outlierCount > 0 ? ((1 << args.outlierBits) - 1) : 0;
-    const float k_outl_cb_lane = args.outlierCount > 0 ? K_cb[(1 << args.bits) + ((int)tiisg & k_outl_cb_mask)] : 0.0f;
 
     // KV loop: process nthreads=128 cells per outer iteration.
     for (int k_VKQ_0 = 0; k_VKQ_0 < args.nCells; k_VKQ_0 += nthreads) {
@@ -14352,192 +14061,48 @@ kernel void kernel_tq_fattn_vec_f16(
                 device const uint8_t * packed_row = K_p + (long)cell_rel * args.nKVHeads * args.packedBytes;
                 const float rms_scale = in_range ? K_sc[cell_rel * args.nKVHeads] : 0.0f;
 
+                // Dot product: sum Q_reg[j][k] · decode(K[k])
                 float sum = 0.0f;
-
-                if (args.outlierCount > 0) {
-                    // Build bitmask of outlier channel positions for this cell.
-                    // outlier_indices: [outlierCount] uint8 per (cell × nKVHeads)
-                    device const uint8_t * o_idx = in_range
-                        ? (outl_indices + (long)cell_rel * args.nKVHeads * args.outlierCount
-                           + (long)(head_kv * args.outlierCount))
-                        : nullptr;
-
-                    uint bmap[4] = {0, 0, 0, 0};  // bitmask for D=128
-                    float sum_q_outl = 0.0f;
-                    if (in_range && o_idx != nullptr) {
-                        for (int s = 0; s < args.outlierCount; s++) {
-                            int pos = (int)o_idx[s];
-                            bmap[pos >> 5] |= (1u << (pos & 31));
-                        }
-                        // Accumulate Σ Q[outlier_pos[s]] for outlier asymmetric correction.
-                        for (int s = 0; s < args.outlierCount; s++) {
-                            sum_q_outl += Q_all[j][(int)o_idx[s]];
-                        }
+                for (int k = 0; k < 8; k++) {
+                    const int start_elem = tid_kq * 16 + k * 2;  // float (not float2) index
+                    // Decode 2 K elements.
+                    float k_dec[2];
+                    if (args.bits == 3) {
+                        const int bit_pos0 = start_elem * 3;
+                        const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
+                        const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
+                        int idx0 = (int)((w0 >> sh0) & 7);
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)idx0) * rms_scale;
+                        const int bit_pos1 = (start_elem + 1) * 3;
+                        const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
+                        const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
+                        int idx1 = (int)((w1 >> sh1) & 7);
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)idx1) * rms_scale;
+                    } else if (args.bits == 4) {
+                        // 4-bit nibble decode: start_elem is always even, so both
+                        // nibbles for this pair live in the same byte.
+                        const int byte0 = start_elem >> 1;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)(packed_row[byte0] & 0xF)) * rms_scale;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> 4) & 0xF)) * rms_scale;
+                    } else {
+                        // 2-bit: 4 elements per byte.
+                        const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
+                        const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
                     }
-
-                    // Regular stream: decode K from K_packed at the regular positions.
-                    float reg_sum = 0.0f;
-                    for (int k = 0; k < 8; k++) {
-                        const int d0 = tid_kq * 16 + k * 2;
-                        const int d1 = d0 + 1;
-                        // Compute regular slot r = d - (# outliers below d).
-                        auto outl_below = [&](int d) -> int {
-                            int cnt = 0;
-                            for (int w = 0; w < 4; w++) {
-                                const int wbit = w * 32;
-                                if (wbit + 31 < d)        cnt += popcount(bmap[w]);
-                                else if (wbit < d)        cnt += popcount(bmap[w] & ((1u << (d - wbit)) - 1u));
-                            }
-                            return cnt;
-                        };
-                        const bool is_outl0 = (bmap[d0 >> 5] >> (d0 & 31)) & 1u;
-                        const bool is_outl1 = (bmap[d1 >> 5] >> (d1 & 31)) & 1u;
-                        const int r0 = is_outl0 ? 0 : (d0 - outl_below(d0));
-                        const int r1 = is_outl1 ? 0 : (d1 - outl_below(d1));
-
-                        float k_dec0 = 0.0f, k_dec1 = 0.0f;
-                        if (!is_outl0) {
-                            if (args.bits == 3) {
-                                const int bit_pos = r0 * 3;
-                                const uint w = (uint)packed_row[bit_pos >> 3] | ((uint)packed_row[(bit_pos >> 3) + 1] << 8);
-                                k_dec0 = simd_shuffle(k_cb_lane, (ushort)((w >> (bit_pos & 7)) & 7)) * rms_scale;
-                            } else if (args.bits == 4) {
-                                const int byte0b = r0 >> 1, sh0 = (r0 & 1) * 4;
-                                k_dec0 = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0b] >> sh0) & 0xF)) * rms_scale;
-                            } else {
-                                const int byte0b = r0 >> 2, sh0 = (r0 & 3) * 2;
-                                k_dec0 = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0b] >> sh0) & 3)) * rms_scale;
-                            }
-                            reg_sum += Q_reg[j][k].x * k_dec0;
-                        }
-                        if (!is_outl1) {
-                            if (args.bits == 3) {
-                                const int bit_pos = r1 * 3;
-                                const uint w = (uint)packed_row[bit_pos >> 3] | ((uint)packed_row[(bit_pos >> 3) + 1] << 8);
-                                k_dec1 = simd_shuffle(k_cb_lane, (ushort)((w >> (bit_pos & 7)) & 7)) * rms_scale;
-                            } else if (args.bits == 4) {
-                                const int byte1b = r1 >> 1, sh1 = (r1 & 1) * 4;
-                                k_dec1 = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1b] >> sh1) & 0xF)) * rms_scale;
-                            } else {
-                                const int byte1b = r1 >> 2, sh1 = (r1 & 3) * 2;
-                                k_dec1 = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1b] >> sh1) & 3)) * rms_scale;
-                            }
-                            reg_sum += Q_reg[j][k].y * k_dec1;
-                        }
-                    }
-
-                    // Outlier stream: iterate over all outlier slots (≤32 per head).
-                    float outl_sum = 0.0f;
-                    if (in_range && o_idx != nullptr) {
-                        const float o_rms = outl_scales[cell_rel * args.nKVHeads + head_kv];
-                        device const uint8_t * o_packed_row = outl_packed
-                            + (long)cell_rel * args.nKVHeads * args.outlierPackedBytes
-                            + (long)head_kv * args.outlierPackedBytes;
-                        for (int s = tid_kq; s < args.outlierCount; s += nthreads_KQ) {
-                            float o_val;
-                            if (args.outlierBits == 3) {
-                                const int bit_pos = s * 3;
-                                const uint w = (uint)o_packed_row[bit_pos >> 3] | ((uint)o_packed_row[(bit_pos >> 3) + 1] << 8);
-                                o_val = simd_shuffle(k_outl_cb_lane, (ushort)((w >> (bit_pos & 7)) & 7)) * o_rms;
-                            } else if (args.outlierBits == 4) {
-                                const int byte_s = s >> 1, sh_s = (s & 1) * 4;
-                                o_val = simd_shuffle(k_outl_cb_lane, (ushort)((o_packed_row[byte_s] >> sh_s) & 0xF)) * o_rms;
-                            } else {
-                                const int byte_s = s >> 2, sh_s = (s & 3) * 2;
-                                o_val = simd_shuffle(k_outl_cb_lane, (ushort)((o_packed_row[byte_s] >> sh_s) & 3)) * o_rms;
-                            }
-                            outl_sum += Q_all[j][(int)o_idx[s]] * o_val;
-                        }
-                    }
-
-                    sum = reg_sum + outl_sum;
-                    // Reduce within KQ group (8 threads).
-                    sum += simd_shuffle_xor(sum, 4);
-                    sum += simd_shuffle_xor(sum, 2);
-                    sum += simd_shuffle_xor(sum, 1);
-
-                    // Asymmetric zero correction (outlier-split variant):
-                    // sum += reg_zero * (sum_q_all - sum_q_outl) + outl_zero * sum_q_outl
-                    if (args.asymmetric) {
-                        const float reg_zero  = (zeros   && in_range) ? zeros  [cell_rel * args.nKVHeads + head_kv] : 0.0f;
-                        const float outl_zero = (outl_zeros && in_range) ? outl_zeros[cell_rel * args.nKVHeads + head_kv] : 0.0f;
-                        // sum_q_all (sum of all Q elements) computed from Q_all.
-                        float sum_q_all = 0.0f;
-                        for (int d = tid_kq; d < D; d += nthreads_KQ) sum_q_all += Q_all[j][d];
-                        sum_q_all += simd_shuffle_xor(sum_q_all, 4);
-                        sum_q_all += simd_shuffle_xor(sum_q_all, 2);
-                        sum_q_all += simd_shuffle_xor(sum_q_all, 1);
-                        sum_q_outl += simd_shuffle_xor(sum_q_outl, 4);
-                        sum_q_outl += simd_shuffle_xor(sum_q_outl, 2);
-                        sum_q_outl += simd_shuffle_xor(sum_q_outl, 1);
-                        sum += reg_zero * (sum_q_all - sum_q_outl) + outl_zero * sum_q_outl;
-                    }
-                } else {
-                    // ── Standard decode (no outlier split) ───────────────────────────
-                    // Dot product: sum Q_reg[j][k] · decode(K[k])
-                    for (int k = 0; k < 8; k++) {
-                        const int start_elem = tid_kq * 16 + k * 2;  // float (not float2) index
-                        // Decode 2 K elements.
-                        float k_dec[2];
-                        if (args.bits == 3) {
-                            const int bit_pos0 = start_elem * 3;
-                            const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
-                            const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
-                            int idx0 = (int)((w0 >> sh0) & 7);
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)idx0) * rms_scale;
-                            const int bit_pos1 = (start_elem + 1) * 3;
-                            const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
-                            const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
-                            int idx1 = (int)((w1 >> sh1) & 7);
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)idx1) * rms_scale;
-                        } else if (args.bits == 4) {
-                            // 4-bit: 2 elements per byte (low nibble first)
-                            const int byte0 = start_elem >> 1, sh0 = (start_elem & 1) * 4;
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 0xF)) * rms_scale;
-                            const int byte1 = (start_elem + 1) >> 1, sh1 = ((start_elem + 1) & 1) * 4;
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 0xF)) * rms_scale;
-                        } else {
-                            // bits == 2: 4 elements per byte
-                            const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
-                            const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
-                        }
-                        sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
-                    }
-                    // Reduce within KQ group (8 threads).
-                    sum += simd_shuffle_xor(sum, 4);
-                    sum += simd_shuffle_xor(sum, 2);
-                    sum += simd_shuffle_xor(sum, 1);
-
-                    // Asymmetric zero correction (non-outlier variant):
-                    // sum += zero * sum_q_all
-                    if (args.asymmetric && zeros && in_range) {
-                        float sum_q = 0.0f;
-                        for (int k = 0; k < 8; k++) sum_q += Q_reg[j][k].x + Q_reg[j][k].y;
-                        sum_q += simd_shuffle_xor(sum_q, 4);
-                        sum_q += simd_shuffle_xor(sum_q, 2);
-                        sum_q += simd_shuffle_xor(sum_q, 1);
-                        sum += zeros[cell_rel * args.nKVHeads + head_kv] * sum_q;
-                    }
+                    sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
                 }
+                // Reduce within KQ group (8 threads).
+                sum += simd_shuffle_xor(sum, 4);
+                sum += simd_shuffle_xor(sum, 2);
+                sum += simd_shuffle_xor(sum, 1);
 
-                // QJL residual correction: sum += norm * (1.2533/qjl_rows) * Σ_row sign * qjl_dot[j][row]
-                if (args.qjl_rows > 0 && qjl_norm && qjl_packed && in_range) {
-                    const float qjl_scale = 1.2533141373155001f / (float)args.qjl_rows;
-                    const float norm = qjl_norm[cell_rel * args.nKVHeads + head_kv];
-                    device const uint8_t * cell_qjl = qjl_packed
-                        + (long)cell_rel * args.nKVHeads * args.qjl_packedBytes
-                        + (long)head_kv * args.qjl_packedBytes;
-                    float sign_dot = 0.0f;
-                    for (int row = (int)tid_kq; row < args.qjl_rows; row += nthreads_KQ) {
-                        const int sign = ((cell_qjl[row >> 3] >> (row & 7)) & 1) ? 1 : -1;
-                        sign_dot += (float)sign * qjl_dot[j][row];
-                    }
-                    sign_dot += simd_shuffle_xor(sign_dot, 4);
-                    sign_dot += simd_shuffle_xor(sign_dot, 2);
-                    sign_dot += simd_shuffle_xor(sign_dot, 1);
-                    sum += norm * qjl_scale * sign_dot;
+                // Asymmetric mean correction: K was encoded as (K - mean);
+                // add back mean × Σ_e Q[e] to restore the true Q·K dot product.
+                if (args.asymmetric && K_zr) {
+                    const float zero_val = in_range ? K_zr[(long)cell_rel * args.nKVHeads] : 0.0f;
+                    sum += zero_val * sum_q[j];
                 }
 
                 if (args.logit_softcap != 0.0f) {
@@ -14684,6 +14249,300 @@ kernel void kernel_tq_fattn_vec_f16(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// kernel_tq_fattn_vec_f16_d64
+// TQ fused flash-attention at head dim 64: K packed i8, V f16.
+// Same thread layout as D=128 (32×4 = 128 threads) but half the Q/K/V work
+// per thread.  Each thread handles 4 float2 of Q (vs 8 at D=128), one V pass
+// (vs two), and only threads 0..63 write output.
+// Grid:  (ntiles_x, 1, nHeadsQ*nSeq)
+// ─────────────────────────────────────────────────────────────────────────────
+kernel void kernel_tq_fattn_vec_f16_d64(
+    constant   ggml_metal_kargs_tq_fattn_vec & args,
+    device const char    * Q_data    [[buffer(1)]],
+    device const uint8_t * K_packed  [[buffer(2)]],
+    device const half    * V_data    [[buffer(3)]],
+    device const half    * mask_data [[buffer(4)]],
+    device const float   * K_scales  [[buffer(5)]],
+    device const float   * K_cb      [[buffer(6)]],
+    device const float   * dummy_vs  [[buffer(7)]],
+    device const float   * dummy_vc  [[buffer(8)]],
+    device       float   * dst       [[buffer(9)]],
+    device const float   * K_zeros   [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int D           = 64;
+    constexpr int nthreads    = 128;
+    constexpr int nthreads_KQ = 8;
+    constexpr int nthreads_V  = 8;
+    constexpr int V_cols_per_iter   = 4;
+    constexpr int nwarps      = 4;
+
+    const int ic0     = (int)tgpig.x * args.ncols;
+    const int blk_z   = (int)tgpig.z;
+    const int sequence = blk_z / args.nHeadsQ;
+    const int head     = blk_z % args.nHeadsQ;
+    const int gqa_ratio = args.nHeadsQ / args.nKVHeads;
+    const int head_kv   = head / gqa_ratio;
+
+    const int tid = (int)sgitg * 32 + (int)tiisg;
+
+    device const float * Q = (device const float *)Q_data
+        + (long)sequence * (args.nb03 / sizeof(float))
+        + (long)head * (args.nb02 / sizeof(float))
+        + (long)ic0  * (args.nb01 / sizeof(float));
+
+    device const uint8_t * K_p = K_packed
+        + (long)args.firstCell * args.nKVHeads * args.packedBytes
+        + (long)head_kv * args.packedBytes;
+    device const float * K_sc = K_scales
+        + (long)args.firstCell * args.nKVHeads + head_kv;
+    device const float * K_zr = args.asymmetric
+        ? (K_zeros + (long)args.firstCell * args.nKVHeads + head_kv)
+        : nullptr;
+
+    device const half * V = V_data
+        + (long)sequence * (args.nb23 / sizeof(half))
+        + (long)head_kv  * (args.nb22 / sizeof(half));
+
+    device const half * maskh = args.hasMask
+        ? (mask_data + (long)ic0 * (args.nb31 / sizeof(half)))
+        : nullptr;
+
+    const int k_cb_mask = (1 << args.bits) - 1;
+    const float k_cb_lane = K_cb[tiisg & k_cb_mask];
+
+    const int tid_kq = (int)tiisg % nthreads_KQ;
+
+    // D=64: each thread loads 4 float2 = D/(2*nthreads_KQ).
+    float2 Q_reg[2][4];
+    for (int j = 0; j < args.ncols; j++) {
+        device const float2 * Q_j = (device const float2 *)(Q + (long)j * (args.nb01 / sizeof(float)));
+        for (int i = 0; i < 4; i++) {
+            const int elem = tid_kq * 4 + i;
+            Q_reg[j][i] = (elem < D/2) ? Q_j[elem] : float2(0.0f, 0.0f);
+        }
+        for (int i = 0; i < 4; i++) {
+            Q_reg[j][i].x *= args.scale;
+            Q_reg[j][i].y *= args.scale;
+        }
+    }
+
+    // Precompute sum_q[j] = Σ_e scaled_Q[j][e] for asymmetric zero correction.
+    float sum_q[2] = { 0.0f, 0.0f };
+    if (args.asymmetric) {
+        for (int j = 0; j < args.ncols; j++) {
+            float local_sum = 0.0f;
+            for (int k = 0; k < D/(2*nthreads_KQ); k++) {
+                local_sum += Q_reg[j][k].x + Q_reg[j][k].y;
+            }
+            local_sum += simd_shuffle_xor(local_sum, 4);
+            local_sum += simd_shuffle_xor(local_sum, 2);
+            local_sum += simd_shuffle_xor(local_sum, 1);
+            sum_q[j] = local_sum;
+        }
+    }
+
+    float2 VKQ[2][4];
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 4; i++)
+            VKQ[j][i] = float2(0.0f, 0.0f);
+
+    float KQ_max[2] = { -FLT_MAX/2.0f, -FLT_MAX/2.0f };
+    float KQ_sum[2] = { 0.0f, 0.0f };
+
+    // D=64: KQ_tg = nwarps*V_cols_per_iter*D = 4*4*64 = 1024 floats.
+    threadgroup float KQ_tg[1024];
+    threadgroup float KQ_max_tg[2][32];
+    threadgroup float KQ_sum_tg[2][32];
+
+    for (int k_VKQ_0 = 0; k_VKQ_0 < args.nCells; k_VKQ_0 += nthreads) {
+
+        float KQ_max_new[2] = { KQ_max[0], KQ_max[1] };
+
+        for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; i_KQ_0++) {
+            const int kq_grp_start = ((int)tiisg & ~(nthreads_KQ - 1));
+            const int i_KQ = (int)sgitg * 32 + kq_grp_start + i_KQ_0;
+            const int cell_rel = k_VKQ_0 + i_KQ;
+            const bool in_range = (cell_rel < args.nCells);
+
+            for (int j = 0; j < args.ncols; j++) {
+                device const uint8_t * packed_row = K_p + (long)cell_rel * args.nKVHeads * args.packedBytes;
+                const float rms_scale = in_range ? K_sc[cell_rel * args.nKVHeads] : 0.0f;
+
+                // D=64: 4 k-iterations × 2 elements each = 8 D-positions per thread.
+                float sum = 0.0f;
+                for (int k = 0; k < 4; k++) {
+                    const int start_elem = tid_kq * 8 + k * 2;
+                    float k_dec[2];
+                    if (args.bits == 3) {
+                        const int bit_pos0 = start_elem * 3;
+                        const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
+                        const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
+                        int idx0 = (int)((w0 >> sh0) & 7);
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)idx0) * rms_scale;
+                        const int bit_pos1 = (start_elem + 1) * 3;
+                        const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
+                        const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
+                        int idx1 = (int)((w1 >> sh1) & 7);
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)idx1) * rms_scale;
+                    } else if (args.bits == 4) {
+                        // 4-bit nibble decode: start_elem is always even, so both
+                        // nibbles for this pair live in the same byte.
+                        const int byte0 = start_elem >> 1;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)(packed_row[byte0] & 0xF)) * rms_scale;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> 4) & 0xF)) * rms_scale;
+                    } else {
+                        // 2-bit: 4 elements per byte.
+                        const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
+                        const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
+                    }
+                    sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
+                }
+                sum += simd_shuffle_xor(sum, 4);
+                sum += simd_shuffle_xor(sum, 2);
+                sum += simd_shuffle_xor(sum, 1);
+
+                // Asymmetric mean correction: K was encoded as (K - mean);
+                // add back mean × Σ_e Q[e] to restore the true Q·K dot product.
+                if (args.asymmetric && K_zr) {
+                    const float zero_val = in_range ? K_zr[(long)cell_rel * args.nKVHeads] : 0.0f;
+                    sum += zero_val * sum_q[j];
+                }
+
+                if (args.logit_softcap != 0.0f) {
+                    sum = args.logit_softcap * tanh(sum);
+                }
+
+                if (maskh && (args.ncols == 1 || ic0 + j < args.nTokensQ)) {
+                    sum += float(maskh[(long)j * args.ne31 + i_KQ]);
+                }
+
+                if (!in_range) sum = -FLT_MAX/2.0f;
+
+                KQ_max_new[j] = max(KQ_max_new[j], sum + 0.6931f);
+
+                if (tid_kq == (uint)i_KQ_0) {
+                    KQ_tg[j * nthreads + tid] = sum;
+                }
+            }
+        }
+
+        for (int j = 0; j < args.ncols; j++) {
+            KQ_max_new[j] = simd_max(KQ_max_new[j]);
+
+            const float KQ_max_scale = exp(KQ_max[j] - KQ_max_new[j]);
+            KQ_max[j] = KQ_max_new[j];
+
+            const float kq_val = KQ_tg[j * nthreads + tid];
+            const float kq_exp = exp(kq_val - KQ_max[j]);
+            KQ_sum[j] = KQ_sum[j] * KQ_max_scale + kq_exp;
+            KQ_tg[j * nthreads + tid] = kq_exp;
+
+            for (int i = 0; i < 4; i++) {
+                VKQ[j][i].x *= KQ_max_scale;
+                VKQ[j][i].y *= KQ_max_scale;
+            }
+        }
+
+        // D=64: 1 pass × 64 V-elements → VKQ[0..3].
+        for (int k0 = 0; k0 < 32; k0 += V_cols_per_iter) {
+            const int k = (int)sgitg * 32 + k0 + (int)tiisg / nthreads_V;
+            const int cell_rel = k_VKQ_0 + k;
+
+            float KQ_k[2];
+            for (int j = 0; j < args.ncols; j++) {
+                KQ_k[j] = KQ_tg[j * nthreads + k];
+            }
+
+            device const half * V_cell = (cell_rel < args.nCells)
+                ? V + (long)cell_rel * (args.nb21 / sizeof(half))
+                : nullptr;
+
+            const int v_tid = (int)tiisg % nthreads_V;
+            const int elem = v_tid * 8;  // pass 0 only
+            for (int i = 0; i < 8; i++) {
+                float v_val = (V_cell && (elem + i) < D) ? float(V_cell[elem + i]) : 0.0f;
+                const int vkq_idx = i / 2;
+                for (int j = 0; j < args.ncols; j++) {
+                    if (i % 2 == 0) VKQ[j][vkq_idx].x += v_val * KQ_k[j];
+                    else            VKQ[j][vkq_idx].y += v_val * KQ_k[j];
+                }
+            }
+        }
+    } // end KV loop
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = 0; j < args.ncols; j++) {
+        if (sgitg == 0) {
+            KQ_max_tg[j][tiisg] = -FLT_MAX/2.0f;
+            KQ_sum_tg[j][tiisg] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = 0; j < args.ncols; j++) {
+        if (tiisg == 0) {
+            KQ_max_tg[j][sgitg] = KQ_max[j];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = 0; j < args.ncols; j++) {
+        if (args.ncols > 1 && ic0 + j >= args.nTokensQ) break;
+
+        float kqmax_new = KQ_max_tg[j][tiisg];
+        kqmax_new = simd_max(kqmax_new);
+        const float kqmax_scale = exp(KQ_max[j] - kqmax_new);
+        KQ_max[j] = kqmax_new;
+
+        for (int i = 0; i < 4; i++) {
+            VKQ[j][i].x *= kqmax_scale;
+            VKQ[j][i].y *= kqmax_scale;
+        }
+
+        // D=64: VKQ_tg layout: sgitg*(V_cols_per_iter*D/2) + (tiisg/nthreads_V)*(D/2)
+        //   = sgitg*128 + (tiisg/8)*32.  Only 4 float2 per thread (1 pass).
+        const int v_tid = (int)tiisg % nthreads_V;
+        threadgroup float2 * VKQ_tg = (threadgroup float2 *)KQ_tg
+            + (long)sgitg * (V_cols_per_iter * D/2)
+            + (long)((int)tiisg / nthreads_V) * (D/2);
+        VKQ_tg[v_tid * 4 + 0] = VKQ[j][0];
+        VKQ_tg[v_tid * 4 + 1] = VKQ[j][1];
+        VKQ_tg[v_tid * 4 + 2] = VKQ[j][2];
+        VKQ_tg[v_tid * 4 + 3] = VKQ[j][3];
+
+        KQ_sum[j] *= kqmax_scale;
+        KQ_sum[j] = simd_sum(KQ_sum[j]);
+        if (tiisg == 0) {
+            KQ_sum_tg[j][sgitg] = KQ_sum[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // D=64: only first 64 threads write output.
+        if (tid < D) {
+            KQ_sum[j] = KQ_sum_tg[j][tiisg];
+            KQ_sum[j] = simd_sum(KQ_sum[j]);
+
+            float dst_val = 0.0f;
+            for (int w = 0; w < nwarps; w++) {
+                for (int v = 0; v < V_cols_per_iter; v++) {
+                    dst_val += ((threadgroup float *)KQ_tg)[w * V_cols_per_iter * D + v * D + tid];
+                }
+            }
+            dst_val /= KQ_sum[j];
+            const long out_idx = ((long)sequence * args.nTokensQ + ic0 + j) * args.nHeadsQ + head;
+            dst[out_idx * D + tid] = dst_val;
+        }
+        if (j < args.ncols - 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // kernel_tq_fattn_vec_f16_d256
 // TQ fused flash-attention at head dim 256: K packed i8, V f16.
 // Thread layout identical to the D=128 variant (32×4 = 128 threads) but each
@@ -14693,23 +14552,16 @@ kernel void kernel_tq_fattn_vec_f16(
 // ─────────────────────────────────────────────────────────────────────────────
 kernel void kernel_tq_fattn_vec_f16_d256(
     constant   ggml_metal_kargs_tq_fattn_vec & args,
-    device const char    * Q_data         [[buffer(1)]],
-    device const uint8_t * K_packed       [[buffer(2)]],
-    device const half    * V_data         [[buffer(3)]],
-    device const half    * mask_data      [[buffer(4)]],
-    device const float   * K_scales       [[buffer(5)]],
-    device const float   * K_cb           [[buffer(6)]],
-    device const float   * dummy_vs       [[buffer(7)]],
-    device const float   * dummy_vc       [[buffer(8)]],
-    device       float   * dst            [[buffer(9)]],
-    device const float   * zeros          [[buffer(10)]],
-    device const uint8_t * qjl_packed     [[buffer(11)]],
-    device const float   * qjl_norm       [[buffer(12)]],
-    device const float   * qjl_projection [[buffer(13)]],
-    device const uint8_t * outl_packed    [[buffer(14)]],
-    device const float   * outl_scales    [[buffer(15)]],
-    device const uint8_t * outl_indices   [[buffer(16)]],
-    device const float   * outl_zeros     [[buffer(17)]],
+    device const char    * Q_data    [[buffer(1)]],
+    device const uint8_t * K_packed  [[buffer(2)]],
+    device const half    * V_data    [[buffer(3)]],
+    device const half    * mask_data [[buffer(4)]],
+    device const float   * K_scales  [[buffer(5)]],
+    device const float   * K_cb      [[buffer(6)]],
+    device const float   * dummy_vs  [[buffer(7)]],
+    device const float   * dummy_vc  [[buffer(8)]],
+    device       float   * dst       [[buffer(9)]],
+    device const float   * K_zeros   [[buffer(10)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint  tiisg [[thread_index_in_simdgroup]],
     uint  sgitg [[simdgroup_index_in_threadgroup]])
@@ -14740,6 +14592,9 @@ kernel void kernel_tq_fattn_vec_f16_d256(
         + (long)head_kv * args.packedBytes;
     device const float * K_sc = K_scales
         + (long)args.firstCell * args.nKVHeads + head_kv;
+    device const float * K_zr = args.asymmetric
+        ? (K_zeros + (long)args.firstCell * args.nKVHeads + head_kv)
+        : nullptr;
 
     device const half * V = V_data
         + (long)sequence * (args.nb23 / sizeof(half))
@@ -14769,6 +14624,21 @@ kernel void kernel_tq_fattn_vec_f16_d256(
     }
 
     // D=256: VKQ holds 4 passes × 4 float2 = 16 float2 per query slot.
+    // Precompute sum_q[j] = Σ_e scaled_Q[j][e] for asymmetric zero correction.
+    float sum_q[2] = { 0.0f, 0.0f };
+    if (args.asymmetric) {
+        for (int j = 0; j < args.ncols; j++) {
+            float local_sum = 0.0f;
+            for (int k = 0; k < D/(2*nthreads_KQ); k++) {
+                local_sum += Q_reg[j][k].x + Q_reg[j][k].y;
+            }
+            local_sum += simd_shuffle_xor(local_sum, 4);
+            local_sum += simd_shuffle_xor(local_sum, 2);
+            local_sum += simd_shuffle_xor(local_sum, 1);
+            sum_q[j] = local_sum;
+        }
+    }
+
     float2 VKQ[2][16];
     for (int j = 0; j < 2; j++)
         for (int i = 0; i < 16; i++)
@@ -14781,33 +14651,6 @@ kernel void kernel_tq_fattn_vec_f16_d256(
     threadgroup float KQ_tg[4096];
     threadgroup float KQ_max_tg[2][32];
     threadgroup float KQ_sum_tg[2][32];
-    threadgroup float Q_all_d256[2][256];
-    threadgroup float qjl_dot_d256[2][128];  // max 128 QJL rows for D=256
-
-    if (args.asymmetric || args.qjl_rows > 0 || args.outlierCount > 0) {
-        for (int j = 0; j < args.ncols; j++) {
-            for (int k = 0; k < 16; k++) {
-                const int d0 = tid_kq * 32 + k * 2;
-                Q_all_d256[j][d0]   = Q_reg[j][k].x;
-                Q_all_d256[j][d0+1] = Q_reg[j][k].y;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (args.qjl_rows > 0) {
-            for (int j = 0; j < args.ncols; j++) {
-                for (int row = (int)tid; row < args.qjl_rows; row += nthreads) {
-                    float dot = 0.0f;
-                    device const float * proj_row = qjl_projection + row * D;
-                    for (int d = 0; d < D; d++) dot += Q_all_d256[j][d] * proj_row[d];
-                    qjl_dot_d256[j][row] = dot;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    const int k_outl_cb_mask256 = args.outlierCount > 0 ? ((1 << args.outlierBits) - 1) : 0;
-    const float k_outl_cb_lane256 = args.outlierCount > 0 ? K_cb[(1 << args.bits) + ((int)tiisg & k_outl_cb_mask256)] : 0.0f;
 
     for (int k_VKQ_0 = 0; k_VKQ_0 < args.nCells; k_VKQ_0 += nthreads) {
 
@@ -14823,128 +14666,46 @@ kernel void kernel_tq_fattn_vec_f16_d256(
                 device const uint8_t * packed_row = K_p + (long)cell_rel * args.nKVHeads * args.packedBytes;
                 const float rms_scale = in_range ? K_sc[cell_rel * args.nKVHeads] : 0.0f;
 
+                // D=256: 16 k-iterations × 2 elements each = 32 D-positions per thread.
                 float sum = 0.0f;
-
-                if (args.outlierCount > 0) {
-                    // bmap[8] covers all 256 dimensions (one bit per channel).
-                    device const uint8_t * o_idx = in_range
-                        ? (outl_indices + (long)cell_rel * args.nKVHeads * args.outlierCount
-                           + (long)(head_kv * args.outlierCount))
-                        : nullptr;
-                    uint bmap[8] = {0,0,0,0,0,0,0,0};
-                    float sum_q_outl = 0.0f;
-                    if (in_range && o_idx) {
-                        for (int s = 0; s < args.outlierCount; s++) {
-                            int pos = (int)o_idx[s]; bmap[pos >> 5] |= (1u << (pos & 31));
-                        }
-                        for (int s = 0; s < args.outlierCount; s++) sum_q_outl += Q_all_d256[j][(int)o_idx[s]];
+                for (int k = 0; k < 16; k++) {
+                    const int start_elem = tid_kq * 32 + k * 2;  // float index [0..254]
+                    float k_dec[2];
+                    if (args.bits == 3) {
+                        const int bit_pos0 = start_elem * 3;
+                        const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
+                        const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
+                        int idx0 = (int)((w0 >> sh0) & 7);
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)idx0) * rms_scale;
+                        const int bit_pos1 = (start_elem + 1) * 3;
+                        const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
+                        const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
+                        int idx1 = (int)((w1 >> sh1) & 7);
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)idx1) * rms_scale;
+                    } else if (args.bits == 4) {
+                        // 4-bit nibble decode: start_elem is always even, so both
+                        // nibbles for this pair live in the same byte.
+                        const int byte0 = start_elem >> 1;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)(packed_row[byte0] & 0xF)) * rms_scale;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> 4) & 0xF)) * rms_scale;
+                    } else {
+                        // 2-bit: 4 elements per byte.
+                        const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
+                        const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
                     }
-                    float reg_sum = 0.0f;
-                    for (int k = 0; k < 16; k++) {
-                        const int d0 = tid_kq * 32 + k * 2, d1 = d0 + 1;
-                        auto outl_below = [&](int d) -> int {
-                            int cnt = 0;
-                            for (int w = 0; w < 8; w++) {
-                                const int wbit = w * 32;
-                                if (wbit + 31 < d) cnt += popcount(bmap[w]);
-                                else if (wbit < d) cnt += popcount(bmap[w] & ((1u << (d - wbit)) - 1u));
-                            }
-                            return cnt;
-                        };
-                        const bool is_outl0 = (bmap[d0>>5] >> (d0&31)) & 1u;
-                        const bool is_outl1 = (bmap[d1>>5] >> (d1&31)) & 1u;
-                        const int r0 = is_outl0 ? 0 : (d0 - outl_below(d0));
-                        const int r1 = is_outl1 ? 0 : (d1 - outl_below(d1));
-                        if (!is_outl0) {
-                            float k0;
-                            if (args.bits == 3) { const int bp=r0*3; const uint w=(uint)packed_row[bp>>3]|((uint)packed_row[(bp>>3)+1]<<8); k0=simd_shuffle(k_cb_lane,(ushort)((w>>(bp&7))&7))*rms_scale; }
-                            else if (args.bits==4) { k0=simd_shuffle(k_cb_lane,(ushort)((packed_row[r0>>1]>>((r0&1)*4))&0xF))*rms_scale; }
-                            else { k0=simd_shuffle(k_cb_lane,(ushort)((packed_row[r0>>2]>>((r0&3)*2))&3))*rms_scale; }
-                            reg_sum += Q_reg[j][k].x * k0;
-                        }
-                        if (!is_outl1) {
-                            float k1;
-                            if (args.bits == 3) { const int bp=r1*3; const uint w=(uint)packed_row[bp>>3]|((uint)packed_row[(bp>>3)+1]<<8); k1=simd_shuffle(k_cb_lane,(ushort)((w>>(bp&7))&7))*rms_scale; }
-                            else if (args.bits==4) { k1=simd_shuffle(k_cb_lane,(ushort)((packed_row[r1>>1]>>((r1&1)*4))&0xF))*rms_scale; }
-                            else { k1=simd_shuffle(k_cb_lane,(ushort)((packed_row[r1>>2]>>((r1&3)*2))&3))*rms_scale; }
-                            reg_sum += Q_reg[j][k].y * k1;
-                        }
-                    }
-                    float outl_sum = 0.0f;
-                    if (in_range && o_idx) {
-                        const float o_rms = outl_scales[cell_rel * args.nKVHeads + head_kv];
-                        device const uint8_t * o_packed_row = outl_packed
-                            + (long)cell_rel * args.nKVHeads * args.outlierPackedBytes
-                            + (long)head_kv * args.outlierPackedBytes;
-                        for (int s = tid_kq; s < args.outlierCount; s += nthreads_KQ) {
-                            float o_val;
-                            if (args.outlierBits==3) { const int bp=s*3; const uint w=(uint)o_packed_row[bp>>3]|((uint)o_packed_row[(bp>>3)+1]<<8); o_val=simd_shuffle(k_outl_cb_lane256,(ushort)((w>>(bp&7))&7))*o_rms; }
-                            else if (args.outlierBits==4) { o_val=simd_shuffle(k_outl_cb_lane256,(ushort)((o_packed_row[s>>1]>>((s&1)*4))&0xF))*o_rms; }
-                            else { o_val=simd_shuffle(k_outl_cb_lane256,(ushort)((o_packed_row[s>>2]>>((s&3)*2))&3))*o_rms; }
-                            outl_sum += Q_all_d256[j][(int)o_idx[s]] * o_val;
-                        }
-                    }
-                    sum = reg_sum + outl_sum;
-                    sum += simd_shuffle_xor(sum, 4); sum += simd_shuffle_xor(sum, 2); sum += simd_shuffle_xor(sum, 1);
-                    if (args.asymmetric) {
-                        const float reg_zero  = (zeros        && in_range) ? zeros       [cell_rel * args.nKVHeads + head_kv] : 0.0f;
-                        const float outl_zero = (outl_zeros && in_range) ? outl_zeros[cell_rel * args.nKVHeads + head_kv] : 0.0f;
-                        float sum_q_all = 0.0f;
-                        for (int d = tid_kq; d < D; d += nthreads_KQ) sum_q_all += Q_all_d256[j][d];
-                        sum_q_all  += simd_shuffle_xor(sum_q_all,  4); sum_q_all  += simd_shuffle_xor(sum_q_all,  2); sum_q_all  += simd_shuffle_xor(sum_q_all,  1);
-                        sum_q_outl += simd_shuffle_xor(sum_q_outl, 4); sum_q_outl += simd_shuffle_xor(sum_q_outl, 2); sum_q_outl += simd_shuffle_xor(sum_q_outl, 1);
-                        sum += reg_zero * (sum_q_all - sum_q_outl) + outl_zero * sum_q_outl;
-                    }
-                } else {
-                    // Standard decode (no outlier split).
-                    // D=256: 16 k-iterations × 2 elements each = 32 D-positions per thread.
-                    for (int k = 0; k < 16; k++) {
-                        const int start_elem = tid_kq * 32 + k * 2;
-                        float k_dec[2];
-                        if (args.bits == 3) {
-                            const int bit_pos0 = start_elem * 3;
-                            const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
-                            const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((w0 >> sh0) & 7)) * rms_scale;
-                            const int bit_pos1 = (start_elem + 1) * 3;
-                            const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
-                            const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((w1 >> sh1) & 7)) * rms_scale;
-                        } else if (args.bits == 4) {
-                            const int byte0 = start_elem >> 1, sh0 = (start_elem & 1) * 4;
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 0xF)) * rms_scale;
-                            const int byte1 = (start_elem + 1) >> 1, sh1 = ((start_elem + 1) & 1) * 4;
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 0xF)) * rms_scale;
-                        } else {
-                            const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
-                            const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
-                        }
-                        sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
-                    }
-                    sum += simd_shuffle_xor(sum, 4); sum += simd_shuffle_xor(sum, 2); sum += simd_shuffle_xor(sum, 1);
-
-                    if (args.asymmetric && zeros && in_range) {
-                        float sum_q = 0.0f;
-                        for (int k = 0; k < 16; k++) sum_q += Q_reg[j][k].x + Q_reg[j][k].y;
-                        sum_q += simd_shuffle_xor(sum_q, 4); sum_q += simd_shuffle_xor(sum_q, 2); sum_q += simd_shuffle_xor(sum_q, 1);
-                        sum += zeros[cell_rel * args.nKVHeads + head_kv] * sum_q;
-                    }
+                    sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
                 }
+                sum += simd_shuffle_xor(sum, 4);
+                sum += simd_shuffle_xor(sum, 2);
+                sum += simd_shuffle_xor(sum, 1);
 
-                // QJL correction (both paths).
-                if (args.qjl_rows > 0 && qjl_norm && qjl_packed && in_range) {
-                    const float qjl_scale = 1.2533141373155001f / (float)args.qjl_rows;
-                    const float norm = qjl_norm[cell_rel * args.nKVHeads + head_kv];
-                    device const uint8_t * cell_qjl = qjl_packed + (long)cell_rel * args.nKVHeads * args.qjl_packedBytes + (long)head_kv * args.qjl_packedBytes;
-                    float sign_dot = 0.0f;
-                    for (int row = (int)tid_kq; row < args.qjl_rows; row += nthreads_KQ) {
-                        const int sign = ((cell_qjl[row >> 3] >> (row & 7)) & 1) ? 1 : -1;
-                        sign_dot += (float)sign * qjl_dot_d256[j][row];
-                    }
-                    sign_dot += simd_shuffle_xor(sign_dot, 4); sign_dot += simd_shuffle_xor(sign_dot, 2); sign_dot += simd_shuffle_xor(sign_dot, 1);
-                    sum += norm * qjl_scale * sign_dot;
+                // Asymmetric mean correction: K was encoded as (K - mean);
+                // add back mean × Σ_e Q[e] to restore the true Q·K dot product.
+                if (args.asymmetric && K_zr) {
+                    const float zero_val = in_range ? K_zr[(long)cell_rel * args.nKVHeads] : 0.0f;
+                    sum += zero_val * sum_q[j];
                 }
 
                 if (args.logit_softcap != 0.0f) {
@@ -15103,29 +14864,21 @@ kernel void kernel_tq_fattn_vec_f16_d256(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // kernel_tq_fattn_vec_packed
-// TQ fused flash-attention: K packed TQ, V packed TQ.
+// TQ fused flash-attention: K packed i8, V packed i8.
 // Same thread layout as kernel_tq_fattn_vec_f16.
-// Supports asymmetric mean correction, QJL sketch, and outlier-split decode.
 // ─────────────────────────────────────────────────────────────────────────────
 kernel void kernel_tq_fattn_vec_packed(
     constant   ggml_metal_kargs_tq_fattn_vec & args,
-    device const char    * Q_data         [[buffer(1)]],
-    device const uint8_t * K_packed       [[buffer(2)]],
-    device const uint8_t * V_packed       [[buffer(3)]],
-    device const half    * mask_data      [[buffer(4)]],
-    device const float   * K_scales       [[buffer(5)]],
-    device const float   * K_cb           [[buffer(6)]],
-    device const float   * V_scales       [[buffer(7)]],
-    device const float   * V_cb           [[buffer(8)]],
-    device       float   * dst            [[buffer(9)]],
-    device const float   * zeros          [[buffer(10)]],
-    device const uint8_t * qjl_packed     [[buffer(11)]],
-    device const float   * qjl_norm       [[buffer(12)]],
-    device const float   * qjl_projection [[buffer(13)]],
-    device const uint8_t * outl_packed    [[buffer(14)]],
-    device const float   * outl_scales    [[buffer(15)]],
-    device const uint8_t * outl_indices   [[buffer(16)]],
-    device const float   * outl_zeros     [[buffer(17)]],
+    device const char    * Q_data    [[buffer(1)]],
+    device const uint8_t * K_packed  [[buffer(2)]],
+    device const uint8_t * V_packed  [[buffer(3)]],
+    device const half    * mask_data [[buffer(4)]],
+    device const float   * K_scales  [[buffer(5)]],
+    device const float   * K_cb      [[buffer(6)]],
+    device const float   * V_scales  [[buffer(7)]],
+    device const float   * V_cb      [[buffer(8)]],
+    device       float   * dst       [[buffer(9)]],
+    device const float   * K_zeros   [[buffer(10)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint  tiisg [[thread_index_in_simdgroup]],
     uint  sgitg [[simdgroup_index_in_threadgroup]])
@@ -15157,6 +14910,9 @@ kernel void kernel_tq_fattn_vec_packed(
         + (long)head_kv * args.packedBytes;
     device const float * K_sc = K_scales
         + (long)args.firstCell * args.nKVHeads + head_kv;
+    device const float * K_zr = args.asymmetric
+        ? (K_zeros + (long)args.firstCell * args.nKVHeads + head_kv)
+        : nullptr;
 
     device const uint8_t * V_p = V_packed
         + (long)args.firstCell * args.nKVHeads * args.v_packedBytes
@@ -15188,6 +14944,22 @@ kernel void kernel_tq_fattn_vec_packed(
         }
     }
 
+    // Precompute sum_q[j] = Σ_e scaled_Q[j][e] for asymmetric zero correction.
+    float sum_q[2] = { 0.0f, 0.0f };
+    if (args.asymmetric) {
+        for (int j = 0; j < args.ncols; j++) {
+            float local_sum = 0.0f;
+            for (int k = 0; k < D/(2*nthreads_KQ); k++) {
+                local_sum += Q_reg[j][k].x + Q_reg[j][k].y;
+            }
+            // Reduce within KQ group (same 8 threads share same Q elements).
+            local_sum += simd_shuffle_xor(local_sum, 4);
+            local_sum += simd_shuffle_xor(local_sum, 2);
+            local_sum += simd_shuffle_xor(local_sum, 1);
+            sum_q[j] = local_sum;
+        }
+    }
+
     float2 VKQ[2][8];
     for (int j = 0; j < 2; j++)
         for (int i = 0; i < 8; i++)
@@ -15199,34 +14971,6 @@ kernel void kernel_tq_fattn_vec_packed(
     threadgroup float KQ_tg[2048];
     threadgroup float KQ_max_tg[2][32];
     threadgroup float KQ_sum_tg[2][32];
-    threadgroup float Q_all[2][128];
-    threadgroup float qjl_dot[2][128];
-
-    // *qa: precompute Q_all and qjl_dot (mirrored from kernel_tq_fattn_vec_f16).
-    if (args.asymmetric || args.qjl_rows > 0 || args.outlierCount > 0) {
-        for (int j = 0; j < args.ncols; j++) {
-            for (int k = 0; k < 8; k++) {
-                const int d0 = tid_kq * 16 + k * 2;
-                Q_all[j][d0]   = Q_reg[j][k].x;
-                Q_all[j][d0+1] = Q_reg[j][k].y;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (args.qjl_rows > 0) {
-            for (int j = 0; j < args.ncols; j++) {
-                for (int row = (int)tid; row < args.qjl_rows; row += nthreads) {
-                    float dot = 0.0f;
-                    device const float * proj_row = qjl_projection + row * D;
-                    for (int d = 0; d < D; d++) dot += Q_all[j][d] * proj_row[d];
-                    qjl_dot[j][row] = dot;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    const int k_outl_cb_mask = args.outlierCount > 0 ? ((1 << args.outlierBits) - 1) : 0;
-    const float k_outl_cb_lane = args.outlierCount > 0 ? K_cb[(1 << args.bits) + ((int)tiisg & k_outl_cb_mask)] : 0.0f;
 
     for (int k_VKQ_0 = 0; k_VKQ_0 < args.nCells; k_VKQ_0 += nthreads) {
 
@@ -15243,130 +14987,53 @@ kernel void kernel_tq_fattn_vec_packed(
                 const float rms_scale = in_range ? K_sc[cell_rel * args.nKVHeads] : 0.0f;
 
                 float sum = 0.0f;
+                for (int k = 0; k < 8; k++) {
+                    const int start_elem = tid_kq * 16 + k * 2;
+                    float k_dec[2];
+                    if (args.bits == 3) {
+                        const int bit_pos0 = start_elem * 3;
+                        const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
+                        const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((w0 >> sh0) & 7)) * rms_scale;
+                        const int bit_pos1 = (start_elem + 1) * 3;
+                        const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
+                        const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((w1 >> sh1) & 7)) * rms_scale;
+                    } else if (args.bits == 4) {
+                        // 4-bit nibble decode: start_elem is always even, so both
+                        // nibbles for this pair live in the same byte.
+                        const int byte0 = start_elem >> 1;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)(packed_row[byte0] & 0xF)) * rms_scale;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> 4) & 0xF)) * rms_scale;
+                    } else {
+                        // 2-bit: 4 elements per byte.
+                        const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
+                        const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
+                    }
+                    sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
+                }
+                sum += simd_shuffle_xor(sum, 4);
+                sum += simd_shuffle_xor(sum, 2);
+                sum += simd_shuffle_xor(sum, 1);
 
-                if (args.outlierCount > 0) {
-                    device const uint8_t * o_idx = in_range
-                        ? (outl_indices + (long)cell_rel * args.nKVHeads * args.outlierCount
-                           + (long)(head_kv * args.outlierCount))
-                        : nullptr;
-                    uint bmap[4] = {0, 0, 0, 0};
-                    float sum_q_outl = 0.0f;
-                    if (in_range && o_idx != nullptr) {
-                        for (int s = 0; s < args.outlierCount; s++) {
-                            int pos = (int)o_idx[s]; bmap[pos >> 5] |= (1u << (pos & 31));
-                        }
-                        for (int s = 0; s < args.outlierCount; s++) sum_q_outl += Q_all[j][(int)o_idx[s]];
-                    }
-                    float reg_sum = 0.0f;
-                    for (int k = 0; k < 8; k++) {
-                        const int d0 = tid_kq * 16 + k * 2, d1 = d0 + 1;
-                        auto outl_below = [&](int d) -> int {
-                            int cnt = 0;
-                            for (int w = 0; w < 4; w++) {
-                                const int wbit = w * 32;
-                                if (wbit + 31 < d) cnt += popcount(bmap[w]);
-                                else if (wbit < d) cnt += popcount(bmap[w] & ((1u << (d - wbit)) - 1u));
-                            }
-                            return cnt;
-                        };
-                        const bool is_outl0 = (bmap[d0>>5] >> (d0&31)) & 1u;
-                        const bool is_outl1 = (bmap[d1>>5] >> (d1&31)) & 1u;
-                        const int r0 = is_outl0 ? 0 : (d0 - outl_below(d0));
-                        const int r1 = is_outl1 ? 0 : (d1 - outl_below(d1));
-                        float k0 = 0.0f, k1 = 0.0f;
-                        if (!is_outl0) {
-                            if (args.bits == 3) { const int bp = r0*3; const uint w = (uint)packed_row[bp>>3]|((uint)packed_row[(bp>>3)+1]<<8); k0 = simd_shuffle(k_cb_lane,(ushort)((w>>(bp&7))&7))*rms_scale; }
-                            else if (args.bits == 4) { k0 = simd_shuffle(k_cb_lane,(ushort)((packed_row[r0>>1]>>((r0&1)*4))&0xF))*rms_scale; }
-                            else { k0 = simd_shuffle(k_cb_lane,(ushort)((packed_row[r0>>2]>>((r0&3)*2))&3))*rms_scale; }
-                            reg_sum += Q_reg[j][k].x * k0;
-                        }
-                        if (!is_outl1) {
-                            if (args.bits == 3) { const int bp = r1*3; const uint w = (uint)packed_row[bp>>3]|((uint)packed_row[(bp>>3)+1]<<8); k1 = simd_shuffle(k_cb_lane,(ushort)((w>>(bp&7))&7))*rms_scale; }
-                            else if (args.bits == 4) { k1 = simd_shuffle(k_cb_lane,(ushort)((packed_row[r1>>1]>>((r1&1)*4))&0xF))*rms_scale; }
-                            else { k1 = simd_shuffle(k_cb_lane,(ushort)((packed_row[r1>>2]>>((r1&3)*2))&3))*rms_scale; }
-                            reg_sum += Q_reg[j][k].y * k1;
-                        }
-                    }
-                    float outl_sum = 0.0f;
-                    if (in_range && o_idx != nullptr) {
-                        const float o_rms = outl_scales[cell_rel * args.nKVHeads + head_kv];
-                        device const uint8_t * o_packed_row = outl_packed
-                            + (long)cell_rel * args.nKVHeads * args.outlierPackedBytes
-                            + (long)head_kv * args.outlierPackedBytes;
-                        for (int s = tid_kq; s < args.outlierCount; s += nthreads_KQ) {
-                            float o_val;
-                            if (args.outlierBits == 3) { const int bp = s*3; const uint w = (uint)o_packed_row[bp>>3]|((uint)o_packed_row[(bp>>3)+1]<<8); o_val = simd_shuffle(k_outl_cb_lane,(ushort)((w>>(bp&7))&7))*o_rms; }
-                            else if (args.outlierBits == 4) { o_val = simd_shuffle(k_outl_cb_lane,(ushort)((o_packed_row[s>>1]>>((s&1)*4))&0xF))*o_rms; }
-                            else { o_val = simd_shuffle(k_outl_cb_lane,(ushort)((o_packed_row[s>>2]>>((s&3)*2))&3))*o_rms; }
-                            outl_sum += Q_all[j][(int)o_idx[s]] * o_val;
-                        }
-                    }
-                    sum = reg_sum + outl_sum;
-                    sum += simd_shuffle_xor(sum, 4); sum += simd_shuffle_xor(sum, 2); sum += simd_shuffle_xor(sum, 1);
-                    if (args.asymmetric) {
-                        const float reg_zero  = (zeros     && in_range) ? zeros    [cell_rel * args.nKVHeads + head_kv] : 0.0f;
-                        const float outl_zero = (outl_zeros && in_range) ? outl_zeros[cell_rel * args.nKVHeads + head_kv] : 0.0f;
-                        float sum_q_all = 0.0f;
-                        for (int d = tid_kq; d < D; d += nthreads_KQ) sum_q_all += Q_all[j][d];
-                        sum_q_all  += simd_shuffle_xor(sum_q_all, 4); sum_q_all  += simd_shuffle_xor(sum_q_all, 2); sum_q_all  += simd_shuffle_xor(sum_q_all, 1);
-                        sum_q_outl += simd_shuffle_xor(sum_q_outl, 4); sum_q_outl += simd_shuffle_xor(sum_q_outl, 2); sum_q_outl += simd_shuffle_xor(sum_q_outl, 1);
-                        sum += reg_zero * (sum_q_all - sum_q_outl) + outl_zero * sum_q_outl;
-                    }
-                } else {
-                    // Standard decode (no outlier split).
-                    for (int k = 0; k < 8; k++) {
-                        const int start_elem = tid_kq * 16 + k * 2;
-                        float k_dec[2];
-                        if (args.bits == 3) {
-                            const int bit_pos0 = start_elem * 3;
-                            const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
-                            const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((w0 >> sh0) & 7)) * rms_scale;
-                            const int bit_pos1 = (start_elem + 1) * 3;
-                            const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
-                            const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((w1 >> sh1) & 7)) * rms_scale;
-                        } else if (args.bits == 4) {
-                            const int byte0 = start_elem >> 1, sh0 = (start_elem & 1) * 4;
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 0xF)) * rms_scale;
-                            const int byte1 = (start_elem + 1) >> 1, sh1 = ((start_elem + 1) & 1) * 4;
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 0xF)) * rms_scale;
-                        } else {
-                            const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
-                            const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
-                        }
-                        sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
-                    }
-                    sum += simd_shuffle_xor(sum, 4); sum += simd_shuffle_xor(sum, 2); sum += simd_shuffle_xor(sum, 1);
-                    if (args.asymmetric && zeros && in_range) {
-                        float sum_q = 0.0f;
-                        for (int k = 0; k < 8; k++) sum_q += Q_reg[j][k].x + Q_reg[j][k].y;
-                        sum_q += simd_shuffle_xor(sum_q, 4); sum_q += simd_shuffle_xor(sum_q, 2); sum_q += simd_shuffle_xor(sum_q, 1);
-                        sum += zeros[cell_rel * args.nKVHeads + head_kv] * sum_q;
-                    }
+                // Asymmetric mean correction: K was encoded as (K - mean);
+                // add back mean × Σ_e Q[e] to restore the true Q·K dot product.
+                if (args.asymmetric && K_zr) {
+                    const float zero_val = in_range ? K_zr[(long)cell_rel * args.nKVHeads] : 0.0f;
+                    sum += zero_val * sum_q[j];
                 }
 
-                // QJL residual correction.
-                if (args.qjl_rows > 0 && qjl_norm && qjl_packed && in_range) {
-                    const float qjl_scale = 1.2533141373155001f / (float)args.qjl_rows;
-                    const float norm = qjl_norm[cell_rel * args.nKVHeads + head_kv];
-                    device const uint8_t * cell_qjl = qjl_packed + (long)cell_rel * args.nKVHeads * args.qjl_packedBytes + (long)head_kv * args.qjl_packedBytes;
-                    float sign_dot = 0.0f;
-                    for (int row = (int)tid_kq; row < args.qjl_rows; row += nthreads_KQ) {
-                        const int sign = ((cell_qjl[row >> 3] >> (row & 7)) & 1) ? 1 : -1;
-                        sign_dot += (float)sign * qjl_dot[j][row];
-                    }
-                    sign_dot += simd_shuffle_xor(sign_dot, 4); sign_dot += simd_shuffle_xor(sign_dot, 2); sign_dot += simd_shuffle_xor(sign_dot, 1);
-                    sum += norm * qjl_scale * sign_dot;
+                if (args.logit_softcap != 0.0f) {
+                    sum = args.logit_softcap * tanh(sum);
                 }
-
-                if (args.logit_softcap != 0.0f) sum = args.logit_softcap * tanh(sum);
-                if (maskh && (args.ncols == 1 || ic0 + j < args.nTokensQ)) sum += float(maskh[(long)j * args.ne31 + i_KQ]);
+                if (maskh && (args.ncols == 1 || ic0 + j < args.nTokensQ)) {
+                    sum += float(maskh[(long)j * args.ne31 + i_KQ]);
+                }
                 if (!in_range) sum = -FLT_MAX/2.0f;
 
-                KQ_max_new[j] = max(KQ_max_new[j], sum + 0.6931f);
+                KQ_max_new[j] = max(KQ_max_new[j], sum + 0.6931f);  // FATTN_KQ_MAX_OFFSET = ln(2)
 
                 if (tid_kq == (uint)i_KQ_0) {
                     KQ_tg[j * nthreads + tid] = sum;
@@ -15498,29 +15165,315 @@ kernel void kernel_tq_fattn_vec_packed(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// kernel_tq_fattn_vec_packed_d64
+// TQ fused flash-attention at head dim 64: K packed i8, V packed i8.
+// Mirrors kernel_tq_fattn_vec_packed with 1 V-pass and only threads 0..63
+// writing output.
+// ─────────────────────────────────────────────────────────────────────────────
+kernel void kernel_tq_fattn_vec_packed_d64(
+    constant   ggml_metal_kargs_tq_fattn_vec & args,
+    device const char    * Q_data    [[buffer(1)]],
+    device const uint8_t * K_packed  [[buffer(2)]],
+    device const uint8_t * V_packed  [[buffer(3)]],
+    device const half    * mask_data [[buffer(4)]],
+    device const float   * K_scales  [[buffer(5)]],
+    device const float   * K_cb      [[buffer(6)]],
+    device const float   * V_scales  [[buffer(7)]],
+    device const float   * V_cb      [[buffer(8)]],
+    device       float   * dst       [[buffer(9)]],
+    device const float   * K_zeros   [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int D           = 64;
+    constexpr int nthreads    = 128;
+    constexpr int nthreads_KQ = 8;
+    constexpr int nthreads_V  = 8;
+    constexpr int V_cols_per_iter   = 4;
+    constexpr int nwarps      = 4;
+
+    const int ic0     = (int)tgpig.x * args.ncols;
+    const int blk_z   = (int)tgpig.z;
+    const int sequence = blk_z / args.nHeadsQ;
+    const int head     = blk_z % args.nHeadsQ;
+    const int gqa_ratio = args.nHeadsQ / args.nKVHeads;
+    const int head_kv   = head / gqa_ratio;
+
+    const int tid = (int)sgitg * 32 + (int)tiisg;
+
+    device const float * Q = (device const float *)Q_data
+        + (long)sequence * (args.nb03 / sizeof(float))
+        + (long)head * (args.nb02 / sizeof(float))
+        + (long)ic0  * (args.nb01 / sizeof(float));
+
+    device const uint8_t * K_p = K_packed
+        + (long)args.firstCell * args.nKVHeads * args.packedBytes
+        + (long)head_kv * args.packedBytes;
+    device const float * K_sc = K_scales
+        + (long)args.firstCell * args.nKVHeads + head_kv;
+    device const float * K_zr = args.asymmetric
+        ? (K_zeros + (long)args.firstCell * args.nKVHeads + head_kv)
+        : nullptr;
+
+    device const uint8_t * V_p = V_packed
+        + (long)args.firstCell * args.nKVHeads * args.v_packedBytes
+        + (long)head_kv * args.v_packedBytes;
+    device const float * V_sc = V_scales
+        + (long)args.firstCell * args.nKVHeads + head_kv;
+
+    device const half * maskh = args.hasMask
+        ? (mask_data + (long)ic0 * (args.nb31 / sizeof(half)))
+        : nullptr;
+
+    const int k_cb_mask = (1 << args.bits) - 1;
+    const float k_cb_lane = K_cb[tiisg & k_cb_mask];
+    const int v_cb_mask = (1 << args.v_bits) - 1;
+    const float v_cb_lane = V_cb[tiisg & v_cb_mask];
+
+    const int tid_kq = (int)tiisg % nthreads_KQ;
+
+    float2 Q_reg[2][4];
+    for (int j = 0; j < args.ncols; j++) {
+        device const float2 * Q_j = (device const float2 *)(Q + (long)j * (args.nb01 / sizeof(float)));
+        for (int i = 0; i < 4; i++) {
+            const int elem = tid_kq * 4 + i;
+            Q_reg[j][i] = (elem < D/2) ? Q_j[elem] : float2(0.0f, 0.0f);
+        }
+        for (int i = 0; i < 4; i++) {
+            Q_reg[j][i].x *= args.scale;
+            Q_reg[j][i].y *= args.scale;
+        }
+    }
+
+    // Precompute sum_q[j] = Σ_e scaled_Q[j][e] for asymmetric zero correction.
+    float sum_q[2] = { 0.0f, 0.0f };
+    if (args.asymmetric) {
+        for (int j = 0; j < args.ncols; j++) {
+            float local_sum = 0.0f;
+            for (int k = 0; k < D/(2*nthreads_KQ); k++) {
+                local_sum += Q_reg[j][k].x + Q_reg[j][k].y;
+            }
+            local_sum += simd_shuffle_xor(local_sum, 4);
+            local_sum += simd_shuffle_xor(local_sum, 2);
+            local_sum += simd_shuffle_xor(local_sum, 1);
+            sum_q[j] = local_sum;
+        }
+    }
+
+    float2 VKQ[2][4];
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 4; i++)
+            VKQ[j][i] = float2(0.0f, 0.0f);
+
+    float KQ_max[2] = { -FLT_MAX/2.0f, -FLT_MAX/2.0f };
+    float KQ_sum[2] = { 0.0f, 0.0f };
+
+    threadgroup float KQ_tg[1024];
+    threadgroup float KQ_max_tg[2][32];
+    threadgroup float KQ_sum_tg[2][32];
+
+    for (int k_VKQ_0 = 0; k_VKQ_0 < args.nCells; k_VKQ_0 += nthreads) {
+
+        float KQ_max_new[2] = { KQ_max[0], KQ_max[1] };
+
+        for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; i_KQ_0++) {
+            const int kq_grp_start = ((int)tiisg & ~(nthreads_KQ - 1));
+            const int i_KQ = (int)sgitg * 32 + kq_grp_start + i_KQ_0;
+            const int cell_rel = k_VKQ_0 + i_KQ;
+            const bool in_range = (cell_rel < args.nCells);
+
+            for (int j = 0; j < args.ncols; j++) {
+                device const uint8_t * packed_row = K_p + (long)cell_rel * args.nKVHeads * args.packedBytes;
+                const float rms_scale = in_range ? K_sc[cell_rel * args.nKVHeads] : 0.0f;
+
+                float sum = 0.0f;
+                for (int k = 0; k < 4; k++) {
+                    const int start_elem = tid_kq * 8 + k * 2;
+                    float k_dec[2];
+                    if (args.bits == 3) {
+                        const int bit_pos0 = start_elem * 3;
+                        const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
+                        const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((w0 >> sh0) & 7)) * rms_scale;
+                        const int bit_pos1 = (start_elem + 1) * 3;
+                        const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
+                        const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((w1 >> sh1) & 7)) * rms_scale;
+                    } else if (args.bits == 4) {
+                        // 4-bit nibble decode: start_elem is always even, so both
+                        // nibbles for this pair live in the same byte.
+                        const int byte0 = start_elem >> 1;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)(packed_row[byte0] & 0xF)) * rms_scale;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> 4) & 0xF)) * rms_scale;
+                    } else {
+                        // 2-bit: 4 elements per byte.
+                        const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
+                        const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
+                    }
+                    sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
+                }
+                sum += simd_shuffle_xor(sum, 4);
+                sum += simd_shuffle_xor(sum, 2);
+                sum += simd_shuffle_xor(sum, 1);
+
+                // Asymmetric mean correction: K was encoded as (K - mean);
+                // add back mean × Σ_e Q[e] to restore the true Q·K dot product.
+                if (args.asymmetric && K_zr) {
+                    const float zero_val = in_range ? K_zr[(long)cell_rel * args.nKVHeads] : 0.0f;
+                    sum += zero_val * sum_q[j];
+                }
+
+                if (args.logit_softcap != 0.0f) {
+                    sum = args.logit_softcap * tanh(sum);
+                }
+                if (maskh && (args.ncols == 1 || ic0 + j < args.nTokensQ)) {
+                    sum += float(maskh[(long)j * args.ne31 + i_KQ]);
+                }
+                if (!in_range) sum = -FLT_MAX/2.0f;
+
+                KQ_max_new[j] = max(KQ_max_new[j], sum + 0.6931f);
+
+                if (tid_kq == (uint)i_KQ_0) {
+                    KQ_tg[j * nthreads + tid] = sum;
+                }
+            }
+        }
+
+        for (int j = 0; j < args.ncols; j++) {
+            KQ_max_new[j] = simd_max(KQ_max_new[j]);
+
+            const float KQ_max_scale = exp(KQ_max[j] - KQ_max_new[j]);
+            KQ_max[j] = KQ_max_new[j];
+
+            const float kq_val = KQ_tg[j * nthreads + tid];
+            const float kq_exp = exp(kq_val - KQ_max[j]);
+            KQ_sum[j] = KQ_sum[j] * KQ_max_scale + kq_exp;
+            KQ_tg[j * nthreads + tid] = kq_exp;
+
+            for (int i = 0; i < 4; i++) {
+                VKQ[j][i].x *= KQ_max_scale;
+                VKQ[j][i].y *= KQ_max_scale;
+            }
+        }
+
+        // D=64: 1 pass, V[v_tid*8 .. v_tid*8+7] → VKQ[0..3].
+        for (int k0 = 0; k0 < 32; k0 += V_cols_per_iter) {
+            const int k = (int)sgitg * 32 + k0 + (int)tiisg / nthreads_V;
+            const int cell_rel = k_VKQ_0 + k;
+            const bool in_range_v = (cell_rel < args.nCells);
+
+            float KQ_k[2];
+            for (int j = 0; j < args.ncols; j++) {
+                KQ_k[j] = KQ_tg[j * nthreads + k];
+            }
+
+            device const uint8_t * v_row = in_range_v
+                ? V_p + (long)cell_rel * args.nKVHeads * args.v_packedBytes
+                : nullptr;
+            const float v_rms = in_range_v ? V_sc[cell_rel * args.nKVHeads] : 0.0f;
+
+            const int v_tid = (int)tiisg % nthreads_V;
+            // pass 0 only: V elements [v_tid*8 .. v_tid*8+7] → VKQ[0..3]
+            float v_dec[8];
+            const int start_elem = v_tid * 8;
+            if (v_row && start_elem < D) {
+                tq_decode_8_shfl(v_row, v_cb_lane, v_rms, start_elem, args.v_bits, v_dec);
+            } else {
+                tq_decode_8_shfl(K_p, v_cb_lane, 0.0f, 0, args.v_bits, v_dec);
+            }
+            for (int i = 0; i < 8; i++) {
+                const int vkq_idx = i / 2;
+                for (int j = 0; j < args.ncols; j++) {
+                    if (i % 2 == 0) VKQ[j][vkq_idx].x += v_dec[i] * KQ_k[j];
+                    else            VKQ[j][vkq_idx].y += v_dec[i] * KQ_k[j];
+                }
+            }
+        }
+    } // end KV loop
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = 0; j < args.ncols; j++) {
+        if (sgitg == 0) {
+            KQ_max_tg[j][tiisg] = -FLT_MAX/2.0f;
+            KQ_sum_tg[j][tiisg] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = 0; j < args.ncols; j++) {
+        if (tiisg == 0) {
+            KQ_max_tg[j][sgitg] = KQ_max[j];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = 0; j < args.ncols; j++) {
+        if (args.ncols > 1 && ic0 + j >= args.nTokensQ) break;
+
+        float kqmax_new = KQ_max_tg[j][tiisg];
+        kqmax_new = simd_max(kqmax_new);
+        const float kqmax_scale = exp(KQ_max[j] - kqmax_new);
+        KQ_max[j] = kqmax_new;
+
+        for (int i = 0; i < 4; i++) {
+            VKQ[j][i].x *= kqmax_scale;
+            VKQ[j][i].y *= kqmax_scale;
+        }
+        const int v_tid = (int)tiisg % nthreads_V;
+        threadgroup float2 * VKQ_tg = (threadgroup float2 *)KQ_tg
+            + (long)sgitg * (V_cols_per_iter * D/2)
+            + (long)((int)tiisg / nthreads_V) * (D/2);
+        VKQ_tg[v_tid * 4 + 0] = VKQ[j][0];
+        VKQ_tg[v_tid * 4 + 1] = VKQ[j][1];
+        VKQ_tg[v_tid * 4 + 2] = VKQ[j][2];
+        VKQ_tg[v_tid * 4 + 3] = VKQ[j][3];
+
+        KQ_sum[j] *= kqmax_scale;
+        KQ_sum[j] = simd_sum(KQ_sum[j]);
+        if (tiisg == 0) {
+            KQ_sum_tg[j][sgitg] = KQ_sum[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < D) {
+            KQ_sum[j] = KQ_sum_tg[j][tiisg];
+            KQ_sum[j] = simd_sum(KQ_sum[j]);
+
+            float dst_val = 0.0f;
+            for (int w = 0; w < nwarps; w++) {
+                for (int v = 0; v < V_cols_per_iter; v++) {
+                    dst_val += ((threadgroup float *)KQ_tg)[w * V_cols_per_iter * D + v * D + tid];
+                }
+            }
+            dst_val /= KQ_sum[j];
+            const long out_idx = ((long)sequence * args.nTokensQ + ic0 + j) * args.nHeadsQ + head;
+            dst[out_idx * D + tid] = dst_val;
+        }
+        if (j < args.ncols - 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // kernel_tq_fattn_vec_packed_d256
 // TQ fused flash-attention at head dim 256: K packed i8, V packed i8.
 // Mirrors kernel_tq_fattn_vec_packed with 4 V-passes and 2 outputs per thread.
 // ─────────────────────────────────────────────────────────────────────────────
 kernel void kernel_tq_fattn_vec_packed_d256(
     constant   ggml_metal_kargs_tq_fattn_vec & args,
-    device const char    * Q_data          [[buffer(1)]],
-    device const uint8_t * K_packed        [[buffer(2)]],
-    device const uint8_t * V_packed        [[buffer(3)]],
-    device const half    * mask_data       [[buffer(4)]],
-    device const float   * K_scales        [[buffer(5)]],
-    device const float   * K_cb            [[buffer(6)]],
-    device const float   * V_scales        [[buffer(7)]],
-    device const float   * V_cb            [[buffer(8)]],
-    device       float   * dst             [[buffer(9)]],
-    device const float   * zeros           [[buffer(10)]],
-    device const uint8_t * qjl_packed      [[buffer(11)]],
-    device const float   * qjl_norm        [[buffer(12)]],
-    device const float   * qjl_projection  [[buffer(13)]],
-    device const uint8_t * outlier_packed  [[buffer(14)]],
-    device const float   * outlier_scales  [[buffer(15)]],
-    device const uint8_t * outlier_indices [[buffer(16)]],
-    device const float   * outlier_zeros   [[buffer(17)]],
+    device const char    * Q_data    [[buffer(1)]],
+    device const uint8_t * K_packed  [[buffer(2)]],
+    device const uint8_t * V_packed  [[buffer(3)]],
+    device const half    * mask_data [[buffer(4)]],
+    device const float   * K_scales  [[buffer(5)]],
+    device const float   * K_cb      [[buffer(6)]],
+    device const float   * V_scales  [[buffer(7)]],
+    device const float   * V_cb      [[buffer(8)]],
+    device       float   * dst       [[buffer(9)]],
+    device const float   * K_zeros   [[buffer(10)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint  tiisg [[thread_index_in_simdgroup]],
     uint  sgitg [[simdgroup_index_in_threadgroup]])
@@ -15551,6 +15504,9 @@ kernel void kernel_tq_fattn_vec_packed_d256(
         + (long)head_kv * args.packedBytes;
     device const float * K_sc = K_scales
         + (long)args.firstCell * args.nKVHeads + head_kv;
+    device const float * K_zr = args.asymmetric
+        ? (K_zeros + (long)args.firstCell * args.nKVHeads + head_kv)
+        : nullptr;
 
     device const uint8_t * V_p = V_packed
         + (long)args.firstCell * args.nKVHeads * args.v_packedBytes
@@ -15582,6 +15538,21 @@ kernel void kernel_tq_fattn_vec_packed_d256(
         }
     }
 
+    // Precompute sum_q[j] = Σ_e scaled_Q[j][e] for asymmetric zero correction.
+    float sum_q[2] = { 0.0f, 0.0f };
+    if (args.asymmetric) {
+        for (int j = 0; j < args.ncols; j++) {
+            float local_sum = 0.0f;
+            for (int k = 0; k < D/(2*nthreads_KQ); k++) {
+                local_sum += Q_reg[j][k].x + Q_reg[j][k].y;
+            }
+            local_sum += simd_shuffle_xor(local_sum, 4);
+            local_sum += simd_shuffle_xor(local_sum, 2);
+            local_sum += simd_shuffle_xor(local_sum, 1);
+            sum_q[j] = local_sum;
+        }
+    }
+
     float2 VKQ[2][16];
     for (int j = 0; j < 2; j++)
         for (int i = 0; i < 16; i++)
@@ -15593,34 +15564,6 @@ kernel void kernel_tq_fattn_vec_packed_d256(
     threadgroup float KQ_tg[4096];
     threadgroup float KQ_max_tg[2][32];
     threadgroup float KQ_sum_tg[2][32];
-
-    threadgroup float Q_all_d256[2][256];
-    threadgroup float qjl_dot_d256[2][128];  // max 128 QJL rows for D=256
-
-    if (args.asymmetric || args.qjl_rows > 0 || args.outlierCount > 0) {
-        for (int j = 0; j < args.ncols; j++) {
-            for (int k = 0; k < 16; k++) {
-                const int d0 = tid_kq * 32 + k * 2;
-                Q_all_d256[j][d0]     = Q_reg[j][k].x;
-                Q_all_d256[j][d0 + 1] = Q_reg[j][k].y;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (args.qjl_rows > 0 && qjl_projection) {
-            for (int row = (int)tid; row < args.qjl_rows; row += nthreads) {
-                device const float * proj_row = qjl_projection + (long)row * D;
-                for (int j = 0; j < args.ncols; j++) {
-                    float dot = 0.0f;
-                    for (int d = 0; d < D; d++) dot += Q_all_d256[j][d] * proj_row[d];
-                    qjl_dot_d256[j][row] = dot;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    const int k_outl_cb_mask256 = args.outlierCount > 0 ? ((1 << args.outlierBits) - 1) : 0;
-    const float k_outl_cb_lane256 = args.outlierCount > 0 ? K_cb[(1 << args.bits) + ((int)tiisg & k_outl_cb_mask256)] : 0.0f;
 
     for (int k_VKQ_0 = 0; k_VKQ_0 < args.nCells; k_VKQ_0 += nthreads) {
 
@@ -15637,125 +15580,42 @@ kernel void kernel_tq_fattn_vec_packed_d256(
                 const float rms_scale = in_range ? K_sc[cell_rel * args.nKVHeads] : 0.0f;
 
                 float sum = 0.0f;
-
-                if (args.outlierCount > 0) {
-                    // bmap[8] covers all 256 dimensions (one bit per channel).
-                    device const uint8_t * o_idx = in_range
-                        ? (outlier_indices + (long)cell_rel * args.nKVHeads * args.outlierCount
-                           + (long)(head_kv * args.outlierCount))
-                        : nullptr;
-                    uint bmap[8] = {0,0,0,0,0,0,0,0};
-                    float sum_q_outl = 0.0f;
-                    if (in_range && o_idx) {
-                        for (int s = 0; s < args.outlierCount; s++) {
-                            int pos = (int)o_idx[s]; bmap[pos >> 5] |= (1u << (pos & 31));
-                        }
-                        for (int s = 0; s < args.outlierCount; s++) sum_q_outl += Q_all_d256[j][(int)o_idx[s]];
+                for (int k = 0; k < 16; k++) {
+                    const int start_elem = tid_kq * 32 + k * 2;
+                    float k_dec[2];
+                    if (args.bits == 3) {
+                        const int bit_pos0 = start_elem * 3;
+                        const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
+                        const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((w0 >> sh0) & 7)) * rms_scale;
+                        const int bit_pos1 = (start_elem + 1) * 3;
+                        const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
+                        const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((w1 >> sh1) & 7)) * rms_scale;
+                    } else if (args.bits == 4) {
+                        // 4-bit nibble decode: start_elem is always even, so both
+                        // nibbles for this pair live in the same byte.
+                        const int byte0 = start_elem >> 1;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)(packed_row[byte0] & 0xF)) * rms_scale;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> 4) & 0xF)) * rms_scale;
+                    } else {
+                        // 2-bit: 4 elements per byte.
+                        const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
+                        k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
+                        const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
+                        k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
                     }
-                    float reg_sum = 0.0f;
-                    for (int k = 0; k < 16; k++) {
-                        const int d0 = tid_kq * 32 + k * 2, d1 = d0 + 1;
-                        auto outl_below = [&](int d) -> int {
-                            int cnt = 0;
-                            for (int w = 0; w < 8; w++) {
-                                const int wbit = w * 32;
-                                if (wbit + 31 < d) cnt += popcount(bmap[w]);
-                                else if (wbit < d) cnt += popcount(bmap[w] & ((1u << (d - wbit)) - 1u));
-                            }
-                            return cnt;
-                        };
-                        const bool is_outl0 = (bmap[d0>>5] >> (d0&31)) & 1u;
-                        const bool is_outl1 = (bmap[d1>>5] >> (d1&31)) & 1u;
-                        const int r0 = is_outl0 ? 0 : (d0 - outl_below(d0));
-                        const int r1 = is_outl1 ? 0 : (d1 - outl_below(d1));
-                        if (!is_outl0) {
-                            float k0;
-                            if (args.bits==3) { const int bp=r0*3; const uint w=(uint)packed_row[bp>>3]|((uint)packed_row[(bp>>3)+1]<<8); k0=simd_shuffle(k_cb_lane,(ushort)((w>>(bp&7))&7))*rms_scale; }
-                            else if (args.bits==4) { k0=simd_shuffle(k_cb_lane,(ushort)((packed_row[r0>>1]>>((r0&1)*4))&0xF))*rms_scale; }
-                            else { k0=simd_shuffle(k_cb_lane,(ushort)((packed_row[r0>>2]>>((r0&3)*2))&3))*rms_scale; }
-                            reg_sum += Q_reg[j][k].x * k0;
-                        }
-                        if (!is_outl1) {
-                            float k1;
-                            if (args.bits==3) { const int bp=r1*3; const uint w=(uint)packed_row[bp>>3]|((uint)packed_row[(bp>>3)+1]<<8); k1=simd_shuffle(k_cb_lane,(ushort)((w>>(bp&7))&7))*rms_scale; }
-                            else if (args.bits==4) { k1=simd_shuffle(k_cb_lane,(ushort)((packed_row[r1>>1]>>((r1&1)*4))&0xF))*rms_scale; }
-                            else { k1=simd_shuffle(k_cb_lane,(ushort)((packed_row[r1>>2]>>((r1&3)*2))&3))*rms_scale; }
-                            reg_sum += Q_reg[j][k].y * k1;
-                        }
-                    }
-                    float outl_sum = 0.0f;
-                    if (in_range && o_idx) {
-                        const float o_rms = outlier_scales[cell_rel * args.nKVHeads + head_kv];
-                        device const uint8_t * o_packed_row = outlier_packed
-                            + (long)cell_rel * args.nKVHeads * args.outlierPackedBytes
-                            + (long)head_kv * args.outlierPackedBytes;
-                        for (int s = tid_kq; s < args.outlierCount; s += nthreads_KQ) {
-                            float o_val;
-                            if (args.outlierBits==3) { const int bp=s*3; const uint w=(uint)o_packed_row[bp>>3]|((uint)o_packed_row[(bp>>3)+1]<<8); o_val=simd_shuffle(k_outl_cb_lane256,(ushort)((w>>(bp&7))&7))*o_rms; }
-                            else if (args.outlierBits==4) { o_val=simd_shuffle(k_outl_cb_lane256,(ushort)((o_packed_row[s>>1]>>((s&1)*4))&0xF))*o_rms; }
-                            else { o_val=simd_shuffle(k_outl_cb_lane256,(ushort)((o_packed_row[s>>2]>>((s&3)*2))&3))*o_rms; }
-                            outl_sum += Q_all_d256[j][(int)o_idx[s]] * o_val;
-                        }
-                    }
-                    sum = reg_sum + outl_sum;
-                    sum += simd_shuffle_xor(sum, 4); sum += simd_shuffle_xor(sum, 2); sum += simd_shuffle_xor(sum, 1);
-                    if (args.asymmetric) {
-                        const float reg_zero  = (zeros         && in_range) ? zeros        [cell_rel * args.nKVHeads + head_kv] : 0.0f;
-                        const float outl_zero = (outlier_zeros && in_range) ? outlier_zeros[cell_rel * args.nKVHeads + head_kv] : 0.0f;
-                        float sum_q_all = 0.0f;
-                        for (int d = tid_kq; d < D; d += nthreads_KQ) sum_q_all += Q_all_d256[j][d];
-                        sum_q_all  += simd_shuffle_xor(sum_q_all,  4); sum_q_all  += simd_shuffle_xor(sum_q_all,  2); sum_q_all  += simd_shuffle_xor(sum_q_all,  1);
-                        sum_q_outl += simd_shuffle_xor(sum_q_outl, 4); sum_q_outl += simd_shuffle_xor(sum_q_outl, 2); sum_q_outl += simd_shuffle_xor(sum_q_outl, 1);
-                        sum += reg_zero * (sum_q_all - sum_q_outl) + outl_zero * sum_q_outl;
-                    }
-                } else {
-                    // Standard decode (no outlier split).
-                    for (int k = 0; k < 16; k++) {
-                        const int start_elem = tid_kq * 32 + k * 2;
-                        float k_dec[2];
-                        if (args.bits == 3) {
-                            const int bit_pos0 = start_elem * 3;
-                            const int byte0 = bit_pos0 >> 3, sh0 = bit_pos0 & 7;
-                            const uint w0 = (uint)packed_row[byte0] | ((uint)packed_row[byte0+1] << 8);
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((w0 >> sh0) & 7)) * rms_scale;
-                            const int bit_pos1 = (start_elem + 1) * 3;
-                            const int byte1 = bit_pos1 >> 3, sh1 = bit_pos1 & 7;
-                            const uint w1 = (uint)packed_row[byte1] | ((uint)packed_row[byte1+1] << 8);
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((w1 >> sh1) & 7)) * rms_scale;
-                        } else if (args.bits == 4) {
-                            const int byte0 = start_elem >> 1, sh0 = (start_elem & 1) * 4;
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 0xF)) * rms_scale;
-                            const int byte1 = (start_elem + 1) >> 1, sh1 = ((start_elem + 1) & 1) * 4;
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 0xF)) * rms_scale;
-                        } else {
-                            const int byte0 = start_elem >> 2, sh0 = (start_elem & 3) * 2;
-                            k_dec[0] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte0] >> sh0) & 3)) * rms_scale;
-                            const int byte1 = (start_elem + 1) >> 2, sh1 = ((start_elem + 1) & 3) * 2;
-                            k_dec[1] = simd_shuffle(k_cb_lane, (ushort)((packed_row[byte1] >> sh1) & 3)) * rms_scale;
-                        }
-                        sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
-                    }
-                    sum += simd_shuffle_xor(sum, 4); sum += simd_shuffle_xor(sum, 2); sum += simd_shuffle_xor(sum, 1);
-                    if (args.asymmetric && zeros && in_range) {
-                        float sum_q = 0.0f;
-                        for (int k = 0; k < 16; k++) sum_q += Q_reg[j][k].x + Q_reg[j][k].y;
-                        sum_q += simd_shuffle_xor(sum_q, 4); sum_q += simd_shuffle_xor(sum_q, 2); sum_q += simd_shuffle_xor(sum_q, 1);
-                        sum += zeros[cell_rel * args.nKVHeads + head_kv] * sum_q;
-                    }
+                    sum += Q_reg[j][k].x * k_dec[0] + Q_reg[j][k].y * k_dec[1];
                 }
+                sum += simd_shuffle_xor(sum, 4);
+                sum += simd_shuffle_xor(sum, 2);
+                sum += simd_shuffle_xor(sum, 1);
 
-                // QJL correction (both paths).
-                if (args.qjl_rows > 0 && qjl_norm && qjl_packed && in_range) {
-                    const float qjl_scale = 1.2533141373155001f / (float)args.qjl_rows;
-                    const float norm = qjl_norm[cell_rel * args.nKVHeads + head_kv];
-                    device const uint8_t * cell_qjl = qjl_packed + (long)cell_rel * args.nKVHeads * args.qjl_packedBytes + (long)head_kv * args.qjl_packedBytes;
-                    float sign_dot = 0.0f;
-                    for (int row = (int)tid_kq; row < args.qjl_rows; row += nthreads_KQ) {
-                        const int sign = ((cell_qjl[row >> 3] >> (row & 7)) & 1) ? 1 : -1;
-                        sign_dot += (float)sign * qjl_dot_d256[j][row];
-                    }
-                    sign_dot += simd_shuffle_xor(sign_dot, 4); sign_dot += simd_shuffle_xor(sign_dot, 2); sign_dot += simd_shuffle_xor(sign_dot, 1);
-                    sum += norm * qjl_scale * sign_dot;
+                // Asymmetric mean correction: K was encoded as (K - mean);
+                // add back mean × Σ_e Q[e] to restore the true Q·K dot product.
+                if (args.asymmetric && K_zr) {
+                    const float zero_val = in_range ? K_zr[(long)cell_rel * args.nKVHeads] : 0.0f;
+                    sum += zero_val * sum_q[j];
                 }
 
                 if (args.logit_softcap != 0.0f) {

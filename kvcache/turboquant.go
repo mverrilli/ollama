@@ -37,15 +37,11 @@ type TurboQuantCache struct {
 	// cache instance (avoids log spam: Get() is called every layer every step).
 	logPathOnce [5]sync.Once
 
-	// fusedFallbackEligible gates the inline-decode fused-FA fallback paths (D=64 and D=128)
-	// (Get paths 2 and 4). The CUDA fused kernel is template-instantiated only
-	// at D=128, so models with a larger head dim (gemma4 D=512) must skip it
-	// to avoid a kernel-side GGML_ASSERT. The Metal fused kernel has both
-	// D=128 and D=256 variants (kernel_tq_fattn_vec_*{,_d256}), so gemma3
-	// D=256 is eligible on Metal but not on CUDA until the CUDA kernel gains
-	// a D=256 instantiation. The DequantK + stock FA path (Get paths 0/1/5)
-	// works at any head dim — this gate is specific to the inline-decode
-	// variants.
+	// fusedFallbackEligible gates the inline-decode fused-FA fallback paths (D=64, 128, 256)
+	// (Get paths 2 and 4). The CUDA fused kernel is template-instantiated at
+	// D=64, 128, 256 — covering llama3.2 (64), llama3.1/qwen2.5 (128), and
+	// Gemma (256). Models with D=512 or other unsupported dims fall back to the
+	// DequantK + stock FA path (Get paths 0/1/5), which works at any head dim.
 	fusedFallbackEligible bool
 
 	// preferFusedAttn is true on Metal. At long context, DequantKV + stock FA
@@ -636,7 +632,7 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 
 		// 2. K+V fused inline-decode: reads packed K+V directly, no f16 intermediate.
 		//    Primary path on CUDA/ROCm and Metal decode (Q=1).
-		//    Instantiated at D=128 always; D=256 on Metal only.
+		//    CUDA: D=64, 128, 256. Metal: D=128, 256.
 		if vEncodeResult != nil && c.fusedFallbackEligible {
 			if tqkv, ok := c.compressedK.GetAsTQTensorKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells); ok {
 				c.logPathOnce[2].Do(func() {
@@ -907,18 +903,12 @@ func (c *TurboQuantCache) activateGPUEncode() {
 	}
 
 	// The inline-decode fused-FA fallback paths (Get paths 2 and 4) dispatch
-	// to a kernel that is D-specialised. CUDA has only D=128 today; Metal has
-	// D=128 and D=256 (kernel_tq_fattn_vec_*{,_d256}). Models with an
-	// unsupported head dim (e.g. gemma4 D=512, or gemma3 D=256 on CUDA) must
-	// skip these fallbacks to avoid a kernel-side GGML_ASSERT; path 5
-	// (separate K+V dequant) handles them correctly.
-	c.fusedFallbackEligible = c.headDim == 64 || c.headDim == 128 ||
-		(c.headDim == 256 && c.preferFusedAttn)
+	// to a kernel instantiated at D=64, 128, 256 on CUDA, ROCm, and Metal.
+	// Models with D=512 or other unsupported dims (e.g. gemma4 D=512) must
+	// skip these fallbacks; path 5 (DequantK + stock FA) handles them.
+	c.fusedFallbackEligible = c.headDim == 64 || c.headDim == 128 || c.headDim == 256
 	if !c.fusedFallbackEligible {
-		reason := "headDim not in {64, 128}"
-		if c.headDim == 256 {
-			reason = "headDim == 256 but backend lacks D=256 fused kernel"
-		}
+		reason := "headDim not in {64, 128, 256}"
 		slog.Warn("turboquant: inline-decode fused-FA fallback paths DISABLED — slow DequantK path active; VRAM and throughput will regress",
 			"reason", reason, "headDim", c.headDim)
 	}

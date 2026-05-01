@@ -988,6 +988,7 @@ typedef struct {
     int32_t hasRotation;  // 1 = apply rotation matrix, 0 = skip
     int32_t hasBias;      // 1 = K projection bias present in src[bias_slot]
     int32_t hasCodebook;  // 1 = Lloyd-Max codebook provided, 0 = uniform quantization
+    int32_t asymmetric;   // 1 = compute mean, subtract before quant, write to zeros_out
 } ggml_metal_kargs_tq_encode;
 
 typedef struct {

@@ -168,7 +168,7 @@ void ggml_cuda_tq_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int8_t  * outlier_indices_ptr = outlier_indices_t ? (const int8_t  *)outlier_indices_t->data : nullptr;
     const float   * outlier_zeros_ptr   = outlier_zeros_t   ? (const float   *)outlier_zeros_t->data   : nullptr;
 
-    GGML_ASSERT((D == 64 || D == 128) && "TurboQuant fused kernel: unsupported head_dim (need 64 or 128)");
+    GGML_ASSERT((D == 64 || D == 128 || D == 256) && "TurboQuant fused kernel: unsupported head_dim (need 64, 128, or 256)");
 
     if (logit_softcap != 0.0f) { scale /= logit_softcap; }
 
@@ -210,6 +210,9 @@ void ggml_cuda_tq_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (D == 64) {
         if (logit_softcap == 0.0f) { DISPATCH_NCOLS(64, false); }
         else                       { DISPATCH_NCOLS(64, true);  }
+    } else if (D == 256) {
+        if (logit_softcap == 0.0f) { DISPATCH_NCOLS(256, false); }
+        else                       { DISPATCH_NCOLS(256, true);  }
     } else {
         if (logit_softcap == 0.0f) { DISPATCH_NCOLS(128, false); }
         else                       { DISPATCH_NCOLS(128, true);  }

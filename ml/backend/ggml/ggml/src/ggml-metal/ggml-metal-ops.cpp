@@ -4442,9 +4442,10 @@ int ggml_metal_op_tq_encode(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
-    const int hasRotation = (op->src[1] != nullptr) ? 1 : 0;
-    const int hasBias     = (op->src[5] != nullptr) ? 1 : 0;
-    const int hasCodebook = (op->src[6] != nullptr) ? 1 : 0;
+    const int hasRotation  = (op->src[1] != nullptr) ? 1 : 0;
+    const int asymmetric   = (int)((const int32_t *)op->op_params)[4]; // zeros != NULL
+    const int hasBias      = (op->src[5] != nullptr) ? 1 : 0;
+    const int hasCodebook  = (op->src[6] != nullptr) ? 1 : 0;
 
     ggml_metal_kargs_tq_encode args = {
         /*.headDim     =*/ headDim,
@@ -4455,6 +4456,7 @@ int ggml_metal_op_tq_encode(ggml_metal_op_t ctx, int idx) {
         /*.hasRotation =*/ hasRotation,
         /*.hasBias     =*/ hasBias,
         /*.hasCodebook =*/ hasCodebook,
+        /*.asymmetric  =*/ asymmetric,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_tq_encode(lib);
@@ -4468,16 +4470,21 @@ int ggml_metal_op_tq_encode(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_codebook = hasCodebook
         ? ggml_metal_get_buffer_id(op->src[6])
         : ggml_metal_get_buffer_id(op);
+    // src[2] = zeros output tensor (non-null when asymmetric)
+    ggml_metal_buffer_id bid_zeros    = op->src[2]
+        ? ggml_metal_get_buffer_id(op->src[2])
+        : ggml_metal_get_buffer_id(op);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // k
-    ggml_metal_encoder_set_buffer  (enc, bid_rot,      2); // rotation (or dummy)
+    ggml_metal_encoder_set_buffer  (enc, bid_rot,       2); // rotation (or dummy)
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3); // packed_out (dst)
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4); // scales
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 5); // boundaries
-    ggml_metal_encoder_set_buffer  (enc, bid_k_bias,   6); // k_bias (or dummy)
-    ggml_metal_encoder_set_buffer  (enc, bid_codebook, 7); // codebook (or dummy)
+    ggml_metal_encoder_set_buffer  (enc, bid_k_bias,    6); // k_bias (or dummy)
+    ggml_metal_encoder_set_buffer  (enc, bid_codebook,  7); // codebook (or dummy)
+    ggml_metal_encoder_set_buffer  (enc, bid_zeros,     8); // zeros_out (or dummy)
 
     ggml_metal_encoder_dispatch_threadgroups(enc, batchSize, numKVHeads, 1, block_size, 1, 1);
     return 1;
@@ -4509,6 +4516,7 @@ int ggml_metal_op_tq_encode_v(ggml_metal_op_t ctx, int idx) {
         /*.hasRotation =*/ hasRotation,
         /*.hasBias     =*/ 0,
         /*.hasCodebook =*/ hasCodebook,
+        /*.asymmetric  =*/ 0, // V encode is always symmetric
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_tq_encode_v(lib);
@@ -4572,6 +4580,7 @@ int ggml_metal_op_tq_encode_kv(ggml_metal_op_t ctx, int idx) {
             /*.hasRotation =*/ hasRotation,
             /*.hasBias     =*/ hasBias_k,
             /*.hasCodebook =*/ hasCodebook_k,
+            /*.asymmetric  =*/ 0, // KV path never asymmetric (Go routes to separate K+V)
         };
         ggml_metal_buffer_id bid_k_bias   = hasBias_k
             ? ggml_metal_get_buffer_id(op->src[8])
@@ -4589,6 +4598,7 @@ int ggml_metal_op_tq_encode_kv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 5); // K bounds
         ggml_metal_encoder_set_buffer  (enc, bid_k_bias,     6); // k_bias (or dummy)
         ggml_metal_encoder_set_buffer  (enc, bid_k_codebook, 7); // k_codebook (or dummy)
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 8); // zeros_out (dummy — KV path is always symmetric)
         ggml_metal_encoder_dispatch_threadgroups(enc, batchSize, numKVHeads, 1, block_size, 1, 1);
     }
 
@@ -4716,16 +4726,15 @@ int ggml_metal_op_tq_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         /*.outlierPackedBytes=*/ outlier_packed_bytes,
     };
 
-    // Select D=128 vs D=256 pipeline. Gemma3 runs at headDim=256; everything
-    // else supported so far is D=128.
-    GGML_ASSERT(D == 128 || D == 256);
+    // Select pipeline by D. Supported: 64 (llama3.2:3b), 128 (llama3.1/qwen), 256 (gemma3).
+    GGML_ASSERT(D == 64 || D == 128 || D == 256);
     auto pipeline = v_packed
-        ? (D == 256
-            ? ggml_metal_library_get_pipeline_tq_fattn_vec_packed_d256(lib)
-            : ggml_metal_library_get_pipeline_tq_fattn_vec_packed(lib))
-        : (D == 256
-            ? ggml_metal_library_get_pipeline_tq_fattn_vec_f16_d256(lib)
-            : ggml_metal_library_get_pipeline_tq_fattn_vec_f16(lib));
+        ? (D == 256 ? ggml_metal_library_get_pipeline_tq_fattn_vec_packed_d256(lib)
+         : D == 64  ? ggml_metal_library_get_pipeline_tq_fattn_vec_packed_d64(lib)
+                    : ggml_metal_library_get_pipeline_tq_fattn_vec_packed(lib))
+        : (D == 256 ? ggml_metal_library_get_pipeline_tq_fattn_vec_f16_d256(lib)
+         : D == 64  ? ggml_metal_library_get_pipeline_tq_fattn_vec_f16_d64(lib)
+                    : ggml_metal_library_get_pipeline_tq_fattn_vec_f16(lib));
 
     ggml_metal_buffer_id bid_mask            = hasMask       ? ggml_metal_get_buffer_id(mask)        : ggml_metal_get_buffer_id(op);
     ggml_metal_buffer_id bid_v_scales        = v_packed      ? ggml_metal_get_buffer_id(op->src[6])  : ggml_metal_get_buffer_id(op);
