@@ -444,6 +444,7 @@ static __global__ void tq_flash_attn_ext_vec(
     const int tid_kq = threadIdx.x % nthreads_KQ;
 
     // Load Q into registers from shared memory (stable divergent access).
+    // s_Q_fixed is already pre-scaled, no additional multiply needed.
     float2 Q_reg[ncols][(D/2)/nthreads_KQ];
 #pragma unroll
     for (int j = 0; j < ncols; ++j) {
