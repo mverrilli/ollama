@@ -52,7 +52,9 @@ static void tq_fattn_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     // V strides: only used by !V_PACKED path; pass V strides for the f16 case.
     // For the V_PACKED case these are passed but ignored by the kernel.
-    tq_flash_attn_ext_vec<D, ncols, use_logit_softcap, V_PACKED, HAS_OUTLIERS><<<blocks, threads, 2816 * sizeof(float), ctx.stream()>>>(
+    // smem: 16*D (combine/KQ region) + 2*D (s_Q_fixed, ncols_max=2) + 512 (s_dot_q_fixed, ncols_max*256)
+    constexpr size_t smem = (18 * D + 512) * sizeof(float);
+    tq_flash_attn_ext_vec<D, ncols, use_logit_softcap, V_PACKED, HAS_OUTLIERS><<<blocks, threads, smem, ctx.stream()>>>(
         (const char    *)Q->data,
         (const uint8_t *)K_p->data,
         (const char    *)V->data,
@@ -166,7 +168,7 @@ void ggml_cuda_tq_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int8_t  * outlier_indices_ptr = outlier_indices_t ? (const int8_t  *)outlier_indices_t->data : nullptr;
     const float   * outlier_zeros_ptr   = outlier_zeros_t   ? (const float   *)outlier_zeros_t->data   : nullptr;
 
-    GGML_ASSERT(D == 128); // Phase 1: head_dim=128 only
+    GGML_ASSERT((D == 64 || D == 128) && "TurboQuant fused kernel: unsupported head_dim (need 64 or 128)");
 
     if (logit_softcap != 0.0f) { scale /= logit_softcap; }
 
@@ -174,12 +176,11 @@ void ggml_cuda_tq_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const bool has_outliers = (outlier_count > 0);
 
-    // Outlier dual-stream decode only instantiated for the V_PACKED asymmetric
-    // D=128 combination that the *qa presets exercise. Other combos fall back
-    // to HAS_OUTLIERS=false which ignores outlier_* params.
-    #define DISPATCH(NCOLS, SOFTCAP) \
-        if (v_packed && has_outliers) { \
-            tq_fattn_vec_launch<128, NCOLS, SOFTCAP, true, true>(ctx, dst, scale, logit_softcap, \
+    // Outlier dual-stream decode (HAS_OUTLIERS=true) only instantiated for the
+    // V_PACKED asymmetric D=128 combination. D=64 routes to HAS_OUTLIERS=false.
+    #define DISPATCH(DIM, NCOLS, SOFTCAP) \
+        if (v_packed && has_outliers && DIM == 128) { \
+            tq_fattn_vec_launch<DIM, NCOLS, SOFTCAP, true, true>(ctx, dst, scale, logit_softcap, \
                 bits, firstCell, nCells, nKVHeads, packedBytes, \
                 v_bits, v_packedBytes, v_scales_ptr, v_codebook_ptr, \
                 zeros_ptr, asymmetric, \
@@ -187,14 +188,14 @@ void ggml_cuda_tq_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 outlier_packed_ptr, outlier_scales_ptr, outlier_indices_ptr, outlier_zeros_ptr, \
                 outlier_bits, outlier_count, outlier_packed_bytes); \
         } else if (v_packed) { \
-            tq_fattn_vec_launch<128, NCOLS, SOFTCAP, true, false>(ctx, dst, scale, logit_softcap, \
+            tq_fattn_vec_launch<DIM, NCOLS, SOFTCAP, true, false>(ctx, dst, scale, logit_softcap, \
                 bits, firstCell, nCells, nKVHeads, packedBytes, \
                 v_bits, v_packedBytes, v_scales_ptr, v_codebook_ptr, \
                 zeros_ptr, asymmetric, \
                 qjl_packed_ptr, qjl_norm_ptr, qjl_projection_ptr, qjl_rows, qjl_packedBytes, \
                 nullptr, nullptr, nullptr, nullptr, 0, 0, 0); \
         } else { \
-            tq_fattn_vec_launch<128, NCOLS, SOFTCAP, false, false>(ctx, dst, scale, logit_softcap, \
+            tq_fattn_vec_launch<DIM, NCOLS, SOFTCAP, false, false>(ctx, dst, scale, logit_softcap, \
                 bits, firstCell, nCells, nKVHeads, packedBytes, \
                 0, 0, nullptr, nullptr, \
                 zeros_ptr, asymmetric, \
@@ -202,13 +203,18 @@ void ggml_cuda_tq_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 nullptr, nullptr, nullptr, nullptr, 0, 0, 0); \
         }
 
-    if (ncols == 1) {
-        if (logit_softcap == 0.0f) { DISPATCH(1, false); }
-        else                       { DISPATCH(1, true);  }
+    #define DISPATCH_NCOLS(DIM, SOFTCAP) \
+        if (ncols == 1) { DISPATCH(DIM, 1, SOFTCAP); } \
+        else            { DISPATCH(DIM, 2, SOFTCAP); }
+
+    if (D == 64) {
+        if (logit_softcap == 0.0f) { DISPATCH_NCOLS(64, false); }
+        else                       { DISPATCH_NCOLS(64, true);  }
     } else {
-        if (logit_softcap == 0.0f) { DISPATCH(2, false); }
-        else                       { DISPATCH(2, true);  }
+        if (logit_softcap == 0.0f) { DISPATCH_NCOLS(128, false); }
+        else                       { DISPATCH_NCOLS(128, true);  }
     }
+    #undef DISPATCH_NCOLS
     #undef DISPATCH
 
     CUDA_CHECK(cudaGetLastError());

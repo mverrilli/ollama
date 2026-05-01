@@ -37,7 +37,7 @@ type TurboQuantCache struct {
 	// cache instance (avoids log spam: Get() is called every layer every step).
 	logPathOnce [5]sync.Once
 
-	// fusedFallbackEligible gates the inline-decode fused-FA fallback paths
+	// fusedFallbackEligible gates the inline-decode fused-FA fallback paths (D=64 and D=128)
 	// (Get paths 2 and 4). The CUDA fused kernel is template-instantiated only
 	// at D=128, so models with a larger head dim (gemma4 D=512) must skip it
 	// to avoid a kernel-side GGML_ASSERT. The Metal fused kernel has both
@@ -246,6 +246,11 @@ func (c *TurboQuantCache) Close() {
 
 func (c *TurboQuantCache) SetLayer(layer int)              { c.meta.SetLayer(layer) }
 func (c *TurboQuantCache) SetConfig(config ml.CacheConfig) { c.meta.SetConfig(config) }
+
+// FusedEligible reports whether the inline-decode fused kernel path is active.
+// Only valid after the first Put() call (which triggers activateGPUEncode).
+// Returns false if headDim is not in the supported set — DequantK slow path is active.
+func (c *TurboQuantCache) FusedEligible() bool { return c.fusedFallbackEligible }
 
 // SetLayerKBias passes the K projection bias tensor for the given layer to the
 // TQ compression manager. Called once per layer at model init for architectures
@@ -907,14 +912,14 @@ func (c *TurboQuantCache) activateGPUEncode() {
 	// unsupported head dim (e.g. gemma4 D=512, or gemma3 D=256 on CUDA) must
 	// skip these fallbacks to avoid a kernel-side GGML_ASSERT; path 5
 	// (separate K+V dequant) handles them correctly.
-	c.fusedFallbackEligible = c.headDim == 128 ||
+	c.fusedFallbackEligible = c.headDim == 64 || c.headDim == 128 ||
 		(c.headDim == 256 && c.preferFusedAttn)
 	if !c.fusedFallbackEligible {
-		reason := "headDim != 128"
+		reason := "headDim not in {64, 128}"
 		if c.headDim == 256 {
 			reason = "headDim == 256 but backend lacks D=256 fused kernel"
 		}
-		slog.Info("turboquant: inline-decode fused-FA fallback paths disabled",
+		slog.Warn("turboquant: inline-decode fused-FA fallback paths DISABLED — slow DequantK path active; VRAM and throughput will regress",
 			"reason", reason, "headDim", c.headDim)
 	}
 

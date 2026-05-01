@@ -312,7 +312,7 @@ static __global__ void tq_flash_attn_ext_vec(
 {
 #ifdef FLASH_ATTN_AVAILABLE
     // Skip logit_softcap variants for unsupported D values (mirrors original kernel guard).
-    if (use_logit_softcap && D != 128 && D != 256) {
+    if (use_logit_softcap && D != 64 && D != 128 && D != 256) {
         GGML_UNUSED_VARS(Q, K_packed, V, mask, dst, scales, codebook,
             scale, logit_softcap, bits, firstCell, nCells, nKVHeads, packedBytes,
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,
@@ -414,15 +414,15 @@ static __global__ void tq_flash_attn_ext_vec(
     extern __shared__ float s_mem_all[];
     float * KQ = s_mem_all;
     float * s_Q_fixed = s_mem_all + (ne_KQ > ne_combine ? ne_KQ : ne_combine);
-    float * s_dot_q_fixed = s_Q_fixed + 256;
+    float * s_dot_q_fixed = s_Q_fixed + ncols * D;
 
     const int tid_global = threadIdx.y * WARP_SIZE + threadIdx.x;
 
     // Load Q into shared memory for stable divergent access in the outlier path.
     // Pre-scale on load so consumers can read s_Q_fixed directly.
-    for (int i = tid_global; i < ncols * 128; i += nthreads) {
-        const int head_q = i / 128;
-        const int elem   = i % 128;
+    for (int i = tid_global; i < ncols * D; i += nthreads) {
+        const int head_q = i / D;
+        const int elem   = i % D;
         if (head_q < ncols) {
             const float * Q_ptr = (const float *)(Q + head_q * nb01);
             s_Q_fixed[i] = Q_ptr[elem] * scale;
@@ -453,8 +453,8 @@ static __global__ void tq_flash_attn_ext_vec(
             const int i = k * nthreads_KQ + tid_kq;
             // Q_reg[j][k] stores elements (2*i, 2*i+1)
             // s_Q_fixed is pre-scaled at load time.
-            Q_reg[j][k].x = s_Q_fixed[j * 128 + 2*i];
-            Q_reg[j][k].y = s_Q_fixed[j * 128 + 2*i + 1];
+            Q_reg[j][k].x = s_Q_fixed[j * D + 2*i];
+            Q_reg[j][k].y = s_Q_fixed[j * D + 2*i + 1];
         }
     }
 
@@ -562,7 +562,7 @@ static __global__ void tq_flash_attn_ext_vec(
                     const int pos = (in_range && o_idx_cell) ? (int)o_idx_cell[s] : 0;
 #pragma unroll
                     for (int j = 0; j < ncols; ++j) {
-                        sum_q_outl[j] += s_Q_fixed[j * 128 + pos];
+                        sum_q_outl[j] += s_Q_fixed[j * D + pos];
                     }
                 }
                 __syncwarp();
@@ -602,7 +602,7 @@ static __global__ void tq_flash_attn_ext_vec(
                         const int r = is_outl ? 0 : r_raw;     // safe index when outlier
                         const float k_val = tq_decode_elem(
                             packed_row, codebook, rms_scale, r, bits);
-                        const float q = s_Q_fixed[j * 128 + d];
+                        const float q = s_Q_fixed[j * D + d];
                         if (!is_outl) {
                             reg_sum += q * k_val;
                         }
@@ -635,7 +635,7 @@ static __global__ void tq_flash_attn_ext_vec(
                             : 0.0f;
                         const int pos = (s_valid && in_range && o_idx_cell_saved)
                             ? (int)o_idx_cell_saved[s] : 0;
-                        out_sum += s_Q_fixed[j * 128 + pos] * o_val;
+                        out_sum += s_Q_fixed[j * D + pos] * o_val;
                     }
                     sum = reg_sum + out_sum;  // unconditional warp_reduce_sum below covers it
                 } else {
@@ -646,7 +646,7 @@ static __global__ void tq_flash_attn_ext_vec(
                     // rms_scale==0 for out-of-range cells so decode produces 0 safely.
                     float reg_sum = 0.0f;
                     for (int d = tid_kq; d < D; d += nthreads_KQ) {
-                        reg_sum += s_Q_fixed[j * 128 + d] *
+                        reg_sum += s_Q_fixed[j * D + d] *
                                    tq_decode_elem(packed_row, codebook, rms_scale, d, bits);
                     }
                     sum = reg_sum;
