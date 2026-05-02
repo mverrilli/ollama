@@ -87,13 +87,13 @@ __global__ void tq_encode_kernel(
                 s_reduce[threadIdx.x] += s_reduce[threadIdx.x + stride];
             __syncthreads();
         }
+        // EXPERIMENT: all threads compute regMean directly from the
+        // reduction sum to eliminate the write-then-read pattern.
+        regMean = s_reduce[0] / (float)headDim;
         if (threadIdx.x == 0) {
-            regMean = s_reduce[0] / (float)headDim;
             zeros_out[cell * numKVHeads + head] = regMean;
-            s_reduce[0] = regMean;
         }
         __syncthreads();
-        regMean = s_reduce[0];
     }
 
     float local_sq = 0.0f;
@@ -110,16 +110,17 @@ __global__ void tq_encode_kernel(
         __syncthreads();
     }
 
-    float scale = 0.0f;
+    // All threads compute scale from the reduction sum directly. Avoids the
+    // write-then-read pattern (s_reduce[0] = scale; sync; scale = s_reduce[0])
+    // which can race when the kernel runs the mean reduction immediately
+    // before this RMS reduction (asymmetric path), producing non-deterministic
+    // garbage on llama3.2:3b. See the mean broadcast above for context.
+    float sum_sq = s_reduce[0];
+    float scale = (sum_sq > 1e-12f) ? sqrtf(sum_sq / (float)headDim) : 0.0f;
     if (threadIdx.x == 0) {
-        float sum_sq = s_reduce[0];
-        if (sum_sq > 1e-12f)
-            scale = sqrtf(sum_sq / (float)headDim);
         scales_out[cell * numKVHeads + head] = scale;
-        s_reduce[0] = scale;
     }
     __syncthreads();
-    scale = s_reduce[0];
 
     // ── Step 4: Quantize each element via boundary binary search ─────────────
     for (int i = threadIdx.x; i < headDim; i += blockDim.x) {
@@ -381,13 +382,16 @@ __global__ void tq_encode_kernel_outlier(
             if (threadIdx.x < stride) s_reduce[threadIdx.x] += s_reduce[threadIdx.x + stride];
             __syncthreads();
         }
-        if (threadIdx.x == 0) {
-            regMean = (regularCount > 0) ? (s_reduce[0] / (float)regularCount) : 0.0f;
-            if (zeros_out) zeros_out[cell * numKVHeads + head] = regMean;
-            s_reduce[0] = regMean;
+        // All threads compute regMean directly. The previous write-back-to-
+        // shared-then-read pattern raced under NVCC; see the simple kernel
+        // for the reproducer. The race appears specifically when a second
+        // reduction follows the first (mean → RMS scale), which is the
+        // asymmetric path's signature.
+        regMean = (regularCount > 0) ? (s_reduce[0] / (float)regularCount) : 0.0f;
+        if (threadIdx.x == 0 && zeros_out) {
+            zeros_out[cell * numKVHeads + head] = regMean;
         }
         __syncthreads();
-        regMean = s_reduce[0];
 
         s_reduce[threadIdx.x] = local_sq_reg;
         __syncthreads();
@@ -395,7 +399,7 @@ __global__ void tq_encode_kernel_outlier(
             if (threadIdx.x < stride) s_reduce[threadIdx.x] += s_reduce[threadIdx.x + stride];
             __syncthreads();
         }
-        if (threadIdx.x == 0) {
+        {
             float sum_sq = s_reduce[0];
             if (zeros_out && regularCount > 0) {
                 float centered_sq = sum_sq - regularCount * regMean * regMean;
@@ -403,11 +407,11 @@ __global__ void tq_encode_kernel_outlier(
             } else if (sum_sq > 1e-12f && regularCount > 0) {
                 regScale = sqrtf(sum_sq / (float)regularCount);
             }
+        }
+        if (threadIdx.x == 0) {
             scales_out[cell * numKVHeads + head] = regScale;
-            s_reduce[0] = regScale;
         }
         __syncthreads();
-        regScale = s_reduce[0];
     }
     __syncthreads();
 
@@ -420,13 +424,12 @@ __global__ void tq_encode_kernel_outlier(
             if (threadIdx.x < stride) s_reduce[threadIdx.x] += s_reduce[threadIdx.x + stride];
             __syncthreads();
         }
-        if (threadIdx.x == 0) {
-            outMean = (outlierCount > 0) ? (s_reduce[0] / (float)outlierCount) : 0.0f;
-            if (outlier_zeros_out) outlier_zeros_out[cell * numKVHeads + head] = outMean;
-            s_reduce[0] = outMean;
+        // All threads compute outMean directly (see regMean above for context).
+        outMean = (outlierCount > 0) ? (s_reduce[0] / (float)outlierCount) : 0.0f;
+        if (threadIdx.x == 0 && outlier_zeros_out) {
+            outlier_zeros_out[cell * numKVHeads + head] = outMean;
         }
         __syncthreads();
-        outMean = s_reduce[0];
 
         s_reduce[threadIdx.x] = local_sq_out;
         __syncthreads();
@@ -434,7 +437,7 @@ __global__ void tq_encode_kernel_outlier(
             if (threadIdx.x < stride) s_reduce[threadIdx.x] += s_reduce[threadIdx.x + stride];
             __syncthreads();
         }
-        if (threadIdx.x == 0) {
+        {
             float sum_sq = s_reduce[0];
             if (outlier_zeros_out && outlierCount > 0) {
                 float centered_sq = sum_sq - outlierCount * outMean * outMean;
@@ -442,11 +445,11 @@ __global__ void tq_encode_kernel_outlier(
             } else if (sum_sq > 1e-12f && outlierCount > 0) {
                 outScale = sqrtf(sum_sq / (float)outlierCount);
             }
+        }
+        if (threadIdx.x == 0) {
             outlier_scales[cell * numKVHeads + head] = outScale;
-            s_reduce[0] = outScale;
         }
         __syncthreads();
-        outScale = s_reduce[0];
     }
 
     // Step 6: Quantize regular channels. s_idx[r] stores the code at the
