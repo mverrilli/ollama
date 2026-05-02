@@ -10495,13 +10495,15 @@ kernel void kernel_tq_encode(
             if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // All threads compute mean_val directly from the reduction sum.
+        // The previous write-back-to-shared-then-read pattern raced under
+        // NVCC on the CUDA twin of this kernel (see tq-encode.cu commit
+        // ac34ae96). Apply the same bit-equivalent fix here defensively.
+        const float mean_val = s_reduce[0] / (float)headDim;
         if (tpitg == 0) {
-            const float mean_val = s_reduce[0] / (float)headDim;
             zeros_out[cell * numKVHeads + head] = mean_val;
-            s_reduce[0] = mean_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float mean_val = s_reduce[0];
         for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
             s_rot[i] -= mean_val;
         }
@@ -10523,17 +10525,13 @@ kernel void kernel_tq_encode(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float scale = 0.0f;
+    // All threads compute scale from the reduction sum directly.
+    const float sum_sq = s_reduce[0];
+    float scale = (sum_sq > 1e-12f) ? sqrt(sum_sq / (float)headDim) : 0.0f;
     if (tpitg == 0) {
-        const float sum_sq = s_reduce[0];
-        if (sum_sq > 1e-12f) {
-            scale = sqrt(sum_sq / (float)headDim);
-        }
         scales_out[cell * numKVHeads + head] = scale;
-        s_reduce[0] = scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    scale = s_reduce[0];
 
     // Step 4: Quantize via boundary binary search.
     const int numBoundaries = (1 << bits) - 1;
@@ -10652,17 +10650,13 @@ kernel void kernel_tq_encode_v(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float scale = 0.0f;
+    // All threads compute scale from the reduction sum directly.
+    const float sum_sq = s_reduce[0];
+    float scale = (sum_sq > 1e-12f) ? sqrt(sum_sq / (float)headDim) : 0.0f;
     if (tpitg == 0) {
-        const float sum_sq = s_reduce[0];
-        if (sum_sq > 1e-12f) {
-            scale = sqrt(sum_sq / (float)headDim);
-        }
         scales_out[cell * numKVHeads + head] = scale;
-        s_reduce[0] = scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    scale = s_reduce[0];
 
     const int numBoundaries = (1 << bits) - 1;
     for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
@@ -10823,16 +10817,16 @@ kernel void kernel_tq_encode_outlier(
         if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // All threads compute regScale from the reduction sum directly.
     float regScale = 0.0f;
-    if (tpitg == 0) {
+    {
         const float sum_sq = s_reduce[0];
         if (sum_sq > 1e-12f && regularCount > 0)
             regScale = sqrt(sum_sq / (float)regularCount);
-        scales_out[cell * numKVHeads + head] = regScale;
-        s_reduce[0] = regScale;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    regScale = s_reduce[0];
+    if (tpitg == 0) {
+        scales_out[cell * numKVHeads + head] = regScale;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     s_reduce[tpitg] = local_sq_out;
@@ -10841,16 +10835,17 @@ kernel void kernel_tq_encode_outlier(
         if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // All threads compute outScale from the reduction sum directly.
     float outScale = 0.0f;
-    if (tpitg == 0) {
+    {
         const float sum_sq = s_reduce[0];
         if (sum_sq > 1e-12f && outlierCount > 0)
             outScale = sqrt(sum_sq / (float)outlierCount);
+    }
+    if (tpitg == 0) {
         outlier_scales[cell * numKVHeads + head] = outScale;
-        s_reduce[0] = outScale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    outScale = s_reduce[0];
 
     // Step 5: Quantize regular channels.
     const int numBoundaries = (1 << bits) - 1;

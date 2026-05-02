@@ -13168,10 +13168,9 @@ kernel void kernel_tq_dequant(
 
     // Fast path: when headDim is a multiple of 128 (=32 lanes × 4 elements per thread),
     // each thread decodes 4 consecutive D-positions per iter and writes a single half4.
-    //   bits=2: 4 elems =  8 bits, always byte-aligned (shift0=0), fits in 1 byte.
+    //   bits=2: 4 elems = 8 bits, always byte-aligned (shift0=0 since elem_base mod 4 == 0).
     //   bits=3: 4 elems = 12 bits, shift0 ∈ {0,4}, always fits in a 16-bit window.
-    //   bits=4: 4 elems = 16 bits, shift0=0 always, requires exactly 2 bytes.
-    // A 16-bit window (2 packed bytes) suffices for all three. The scalar fallback
+    // A 16-bit window (2 packed bytes) suffices for both. The scalar fallback
     // covers non-multiple-of-128 head dims.
     if ((args.headDim & 127) == 0) {
         const int iters = args.headDim >> 7;
@@ -13182,7 +13181,7 @@ kernel void kernel_tq_dequant(
             const int shift0      = bit_offset & 7;
 
             uint w = (uint)cell_packed[byte_base];
-            if (args.bits >= 3) {
+            if (args.bits == 3) {
                 w |= ((uint)cell_packed[byte_base + 1] << 8);
             }
 
@@ -13413,13 +13412,15 @@ kernel void kernel_tq_encode(
             if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // All threads compute mean_val directly from the reduction sum.
+        // The previous write-back-to-shared-then-read pattern raced under
+        // NVCC on the CUDA twin of this kernel (see tq-encode.cu commit
+        // ac34ae96). Apply the same bit-equivalent fix here defensively.
+        const float mean_val = s_reduce[0] / (float)headDim;
         if (tpitg == 0) {
-            const float mean_val = s_reduce[0] / (float)headDim;
             zeros_out[cell * numKVHeads + head] = mean_val;
-            s_reduce[0] = mean_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float mean_val = s_reduce[0];
         for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
             s_rot[i] -= mean_val;
         }
@@ -13441,17 +13442,13 @@ kernel void kernel_tq_encode(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float scale = 0.0f;
+    // All threads compute scale from the reduction sum directly.
+    const float sum_sq = s_reduce[0];
+    float scale = (sum_sq > 1e-12f) ? sqrt(sum_sq / (float)headDim) : 0.0f;
     if (tpitg == 0) {
-        const float sum_sq = s_reduce[0];
-        if (sum_sq > 1e-12f) {
-            scale = sqrt(sum_sq / (float)headDim);
-        }
         scales_out[cell * numKVHeads + head] = scale;
-        s_reduce[0] = scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    scale = s_reduce[0];
 
     // Step 4: Quantize via boundary binary search.
     const int numBoundaries = (1 << bits) - 1;
@@ -13570,17 +13567,13 @@ kernel void kernel_tq_encode_v(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float scale = 0.0f;
+    // All threads compute scale from the reduction sum directly.
+    const float sum_sq = s_reduce[0];
+    float scale = (sum_sq > 1e-12f) ? sqrt(sum_sq / (float)headDim) : 0.0f;
     if (tpitg == 0) {
-        const float sum_sq = s_reduce[0];
-        if (sum_sq > 1e-12f) {
-            scale = sqrt(sum_sq / (float)headDim);
-        }
         scales_out[cell * numKVHeads + head] = scale;
-        s_reduce[0] = scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    scale = s_reduce[0];
 
     const int numBoundaries = (1 << bits) - 1;
     for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
@@ -13741,16 +13734,16 @@ kernel void kernel_tq_encode_outlier(
         if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // All threads compute regScale from the reduction sum directly.
     float regScale = 0.0f;
-    if (tpitg == 0) {
+    {
         const float sum_sq = s_reduce[0];
         if (sum_sq > 1e-12f && regularCount > 0)
             regScale = sqrt(sum_sq / (float)regularCount);
-        scales_out[cell * numKVHeads + head] = regScale;
-        s_reduce[0] = regScale;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    regScale = s_reduce[0];
+    if (tpitg == 0) {
+        scales_out[cell * numKVHeads + head] = regScale;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     s_reduce[tpitg] = local_sq_out;
@@ -13759,16 +13752,17 @@ kernel void kernel_tq_encode_outlier(
         if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // All threads compute outScale from the reduction sum directly.
     float outScale = 0.0f;
-    if (tpitg == 0) {
+    {
         const float sum_sq = s_reduce[0];
         if (sum_sq > 1e-12f && outlierCount > 0)
             outScale = sqrt(sum_sq / (float)outlierCount);
+    }
+    if (tpitg == 0) {
         outlier_scales[cell * numKVHeads + head] = outScale;
-        s_reduce[0] = outScale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    outScale = s_reduce[0];
 
     // Step 5: Quantize regular channels.
     const int numBoundaries = (1 << bits) - 1;
