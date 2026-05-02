@@ -250,7 +250,11 @@ static __device__ __forceinline__ float tq_vec_dot_KQ(
 // V_PACKED == false: existing K-only fused path (V is f16, src[6] == NULL)
 // V_PACKED == true:  new K+V fused path (V is packed i8, src[6] = v_scales, src[7] = v_codebook)
 //
-// Phase 1: D == 128, bits runtime param, gridDim.y == 1 (no multi-block).
+// Phase 1: D == 128, bits runtime param.
+// Multi-block KV-split (parallel_blocks > 1): when gridDim.y > 1, blocks share
+// each (Q-tile, head, sequence) and use interleaved K-cell striping. Each block
+// writes its partial VKQ + (KQ_max, KQ_sum) meta into dst / dst_meta workspace
+// slots indexed by blockIdx.y; flash_attn_combine_results combines them.
 template<int D, int ncols, bool use_logit_softcap, bool V_PACKED, bool HAS_OUTLIERS>
 __launch_bounds__(128, 2)
 static __global__ void tq_flash_attn_ext_vec(
@@ -259,6 +263,7 @@ static __global__ void tq_flash_attn_ext_vec(
     const char    * __restrict__ V,
     const char    * __restrict__ mask,
     float         * __restrict__ dst,
+    float2        * __restrict__ dst_meta,
     const float   * __restrict__ scales,
     const float   * __restrict__ codebook,
     float   scale,
@@ -313,7 +318,7 @@ static __global__ void tq_flash_attn_ext_vec(
 #ifdef FLASH_ATTN_AVAILABLE
     // Skip logit_softcap variants for unsupported D values (mirrors original kernel guard).
     if (use_logit_softcap && D != 64 && D != 128 && D != 256) {
-        GGML_UNUSED_VARS(Q, K_packed, V, mask, dst, scales, codebook,
+        GGML_UNUSED_VARS(Q, K_packed, V, mask, dst, dst_meta, scales, codebook,
             scale, logit_softcap, bits, firstCell, nCells, nKVHeads, packedBytes,
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,
             nb21, nb22, nb23, ne31, nb31,
@@ -386,7 +391,19 @@ static __global__ void tq_flash_attn_ext_vec(
         V += (int64_t)nb23*sequence + (int64_t)nb22*head_kv;
     }
 
+    // Multi-block KV-split: when gridDim.y > 1, each block handles an interleaved
+    // subset of K cells starting at blockIdx.y * nthreads, striding by gridDim.y *
+    // nthreads. Bump V (f16 path) and maskh by this block's starting offset so the
+    // existing per-iteration increments (k_VKQ_0 += gridDim.y*nthreads) track them.
+    // Mirrors stock CUDA FA's pattern at fattn-vec.cuh:240-245.
+    if constexpr (!V_PACKED) {
+        V += (int64_t)blockIdx.y * nthreads * nb21;
+    }
+
     const half * maskh = mask ? (const half *)(mask + (int64_t)nb31*ic0) : nullptr;
+    if (maskh) {
+        maskh += blockIdx.y * nthreads;
+    }
 
     // Load one codebook entry per lane for warp-shuffle lookups.
     // For 3-bit (8 entries): lanes 0-7 hold codebook[0-7], lanes 8-15 repeat, etc.
@@ -503,10 +520,13 @@ static __global__ void tq_flash_attn_ext_vec(
         __syncthreads();
     }
 
-    // Main KV loop — single block (gridDim.y == 1).
-    for (int k_VKQ_0 = 0; k_VKQ_0 < nCells; k_VKQ_0 += nthreads,
-             V += (V_PACKED ? 0 : (int64_t)nthreads * nb21),
-             maskh += (maskh ? nthreads : 0)) {
+    // Main KV loop. When gridDim.y > 1, this block handles every gridDim.y'th
+    // chunk of K cells starting at blockIdx.y. Initial K_packed/V/maskh offsets
+    // for blockIdx.y are applied above; the per-iteration increment uses gridDim.y
+    // so successive iterations skip over slices owned by sibling blocks.
+    for (int k_VKQ_0 = blockIdx.y * nthreads; k_VKQ_0 < nCells; k_VKQ_0 += gridDim.y * nthreads,
+             V += (V_PACKED ? 0 : (int64_t)gridDim.y * nthreads * nb21),
+             maskh += (maskh ? gridDim.y * nthreads : 0)) {
 
         float KQ_reg[ncols];
         float KQ_max_new[ncols];
@@ -894,9 +914,27 @@ static __global__ void tq_flash_attn_ext_vec(
                         dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
                     }
                 }
-                dst_val /= KQ_sum[j_VKQ];
-                // Output layout: [D, nHeadsQ, nTokensQ, nSeq] — matches ggml_flash_attn_ext layout.
-                dst[(((int64_t)sequence*(int)ne01.z + ic0 + j_VKQ)*ne02 + head)*D + i0 + tid] = dst_val;
+                // gridDim.y == 1: produce final result (divide by KQ_sum, write to
+                // [D, head, col, seq] dst). gridDim.y > 1: write un-normalised
+                // partial VKQ to workspace at slot blockIdx.y; the combine kernel
+                // (flash_attn_combine_results) does the cross-block normalisation.
+                if (gridDim.y == 1) {
+                    dst_val /= KQ_sum[j_VKQ];
+                }
+                // Output layout: [D, gridDim.y, nHeadsQ, nTokensQ, nSeq] when gridDim.y
+                // > 1 (workspace); [D, nHeadsQ, nTokensQ, nSeq] when gridDim.y == 1
+                // (final). Matches stock CUDA FA layout (fattn-vec.cuh:482) and
+                // flash_attn_combine_results' VKQ_parts addressing.
+                dst[((((int64_t)sequence*(int)ne01.z + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+            }
+
+            // Meta write for the combine kernel. Only when gridDim.y > 1; one thread
+            // per (j_VKQ, blockIdx.y) is sufficient since KQ_max[j_VKQ] / KQ_sum[j_VKQ]
+            // are the cross-warp reduced values for this block's K slice.
+            if (gridDim.y != 1 && tid == 0) {
+                const int64_t meta_offset =
+                    (((int64_t)sequence*(int)ne01.z + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y;
+                dst_meta[meta_offset] = make_float2(KQ_max[j_VKQ], KQ_sum[j_VKQ]);
             }
         }
 
@@ -905,7 +943,7 @@ static __global__ void tq_flash_attn_ext_vec(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K_packed, V, mask, dst, scales, codebook,
+    GGML_UNUSED_VARS(Q, K_packed, V, mask, dst, dst_meta, scales, codebook,
         scale, logit_softcap, bits, firstCell, nCells, nKVHeads, packedBytes,
         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
         nb21, nb22, nb23, ne31, nb31,
