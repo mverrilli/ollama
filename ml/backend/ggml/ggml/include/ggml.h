@@ -2820,6 +2820,10 @@ GGML_API struct ggml_tensor * ggml_tq_dequant_outlier(
 // Combined K+V dequant: single op dequants both K and V packed buffers.
 // Output: [headDim, numKVHeads, nCells, 2] f16 where ne[3]=0 is K, ne[3]=1 is V.
 // Halves scheduler overhead vs separate DequantK + DequantV.
+//
+// Outlier-aware: when k_outlier_packed != NULL (and outlier_count > 0), the K
+// plane is dequanted via the regular+outlier overwrite kernel. The V plane is
+// always plain dequant (V has no outliers in any ship preset).
 GGML_API struct ggml_tensor * ggml_tq_dequant_kv(
         struct ggml_context * ctx,
         struct ggml_tensor  * k_encode_result,
@@ -2828,13 +2832,22 @@ GGML_API struct ggml_tensor * ggml_tq_dequant_kv(
         struct ggml_tensor  * v_encode_result,
         struct ggml_tensor  * v_scales,
         struct ggml_tensor  * v_codebook,
-        struct ggml_tensor  * v_rotation,    // R [headDim, headDim] f32 — undo V rotation during dequant; NULL = no rotation
+        struct ggml_tensor  * v_rotation,        // R [headDim, headDim] f32 — undo V rotation during dequant; NULL = no rotation
         int                  headDim,
         int                  numKVHeads,
         int                  nCells,
         int                  firstCell,
         int                  k_bits,
-        int                  v_bits);
+        int                  v_bits,
+        // K outlier-split (NULL/zero for non-outlier presets):
+        struct ggml_tensor  * k_outlier_packed,  // [outlier_packed_bytes*numKVHeads, capacity] i8
+        struct ggml_tensor  * k_outlier_scales,  // [numKVHeads, capacity] f32
+        struct ggml_tensor  * k_outlier_indices, // [outlier_count*numKVHeads, capacity] i8
+        struct ggml_tensor  * k_outlier_codebook,// [1<<outlier_bits] f32
+        struct ggml_tensor  * k_zeros,           // [numKVHeads, capacity] f32 — asymmetric K zero; NULL = symmetric
+        struct ggml_tensor  * k_outlier_zeros,   // [numKVHeads, capacity] f32 — asymmetric outlier K zero; NULL = symmetric
+        int32_t              outlier_bits,
+        int32_t              outlier_count);
 
 GGML_API struct ggml_tensor * ggml_tq_flash_attn_ext(
         struct ggml_context * ctx,

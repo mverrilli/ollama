@@ -765,13 +765,10 @@ func (m *ggmlTQCompressedK) DequantV(ctx ml.Context, layer int, encodeResult ml.
 // both K and V in one op, halving scheduler overhead vs separate DequantK+DequantV.
 // Returns (kTensor, vTensor) as views into the combined output.
 //
-// When outlier-split is active, the combined kernel cannot be used because
-// its K reader assumes the uniform packed layout. Returns (nil, nil) to
-// force Get() to fall through to the separate DequantK + DequantV path.
+// When outlier-split is active the K plane is dequanted via the
+// regular+outlier overwrite kernel; V is always plain dequant (no V outliers
+// in any ship preset).
 func (m *ggmlTQCompressedK) DequantKV(ctx ml.Context, layer int, kEncodeResult, vEncodeResult ml.Tensor, firstCell, nCells int) (ml.Tensor, ml.Tensor) {
-	if m.hasOutliers() {
-		return nil, nil
-	}
 	kScales := m.scalesTensors[layer]
 	vScales := m.vScalesTensors[layer]
 	if kScales == nil || kEncodeResult == nil || nCells <= 0 {
@@ -780,11 +777,39 @@ func (m *ggmlTQCompressedK) DequantKV(ctx ml.Context, layer int, kEncodeResult, 
 	if vScales == nil || vEncodeResult == nil {
 		return nil, nil
 	}
+
+	var (
+		kOutlierPacked   *Tensor
+		kOutlierScales   *Tensor
+		kOutlierIndices  *Tensor
+		kOutlierCodebook *Tensor
+		kZeros           *Tensor
+		kOutlierZeros    *Tensor
+		outlierBits      int
+		outlierCount     int
+	)
+	if m.hasOutliers() {
+		kOutlierPacked = m.outlierPackedTensors[layer]
+		kOutlierScales = m.outlierScalesTensors[layer]
+		kOutlierIndices = m.outlierIndicesTensors[layer]
+		kOutlierCodebook = m.outlierCodebookTensor
+		kZeros = m.zerosTensors[layer]
+		kOutlierZeros = m.outlierZerosTensors[layer]
+		outlierBits = m.outlierBits
+		outlierCount = m.outlierCount
+		if kOutlierPacked == nil || kOutlierScales == nil || kOutlierIndices == nil || kOutlierCodebook == nil {
+			return nil, nil
+		}
+	}
+
 	combined := TQDequantKV(ctx, m.backend,
 		kEncodeResult.(*Tensor), kScales, m.codebookTensor,
 		vEncodeResult.(*Tensor), vScales, m.vCodebookTensor,
 		m.rotInverseTensor, // R matrix for fused V rotation undo
-		m.headDim, m.numKVHeads, nCells, firstCell, m.bits, m.vBits)
+		m.headDim, m.numKVHeads, nCells, firstCell, m.bits, m.vBits,
+		kOutlierPacked, kOutlierScales, kOutlierIndices, kOutlierCodebook,
+		kZeros, kOutlierZeros,
+		outlierBits, outlierCount)
 
 	// Split the [headDim, numKVHeads, nCells, 2] output into K and V views.
 	planeBytes := m.headDim * m.numKVHeads * nCells * 2 // f16 = 2 bytes

@@ -1788,15 +1788,40 @@ func (t *Tensor) TQDequantOutlier(ctx ml.Context, scales, codebook ml.Tensor, he
 // TQDequantKV creates a GGML_OP_TQ_DEQUANT_KV graph node that dequants both
 // K and V in a single GGML op.  Returns a [headDim, numKVHeads, nCells, 2] f16
 // tensor; the caller splits it into K (ne[3]=0) and V (ne[3]=1) views.
+//
+// kOutlier* and kZeros/kOutlierZeros are nil for non-outlier presets. When
+// non-nil, the K plane is dequanted via the regular+outlier overwrite kernel.
+// V has no outliers in any ship preset, so its plane is always plain dequant.
 func TQDequantKV(ctx ml.Context, b *Backend,
 	kEncode, kScales, kCodebook *Tensor,
 	vEncode, vScales, vCodebook *Tensor,
 	vRotation *Tensor,
 	headDim, numKVHeads, nCells, firstCell, kBits, vBits int,
+	kOutlierPacked, kOutlierScales, kOutlierIndices, kOutlierCodebook *Tensor,
+	kZeros, kOutlierZeros *Tensor,
+	outlierBits, outlierCount int,
 ) *Tensor {
-	var vRotT *C.struct_ggml_tensor
+	var vRotT, kOutlPackedT, kOutlScalesT, kOutlIndicesT, kOutlCbT, kZerosT, kOutlZerosT *C.struct_ggml_tensor
 	if vRotation != nil {
 		vRotT = vRotation.t
+	}
+	if kOutlierPacked != nil {
+		kOutlPackedT = kOutlierPacked.t
+	}
+	if kOutlierScales != nil {
+		kOutlScalesT = kOutlierScales.t
+	}
+	if kOutlierIndices != nil {
+		kOutlIndicesT = kOutlierIndices.t
+	}
+	if kOutlierCodebook != nil {
+		kOutlCbT = kOutlierCodebook.t
+	}
+	if kZeros != nil {
+		kZerosT = kZeros.t
+	}
+	if kOutlierZeros != nil {
+		kOutlZerosT = kOutlierZeros.t
 	}
 	return &Tensor{
 		b: b,
@@ -1815,6 +1840,14 @@ func TQDequantKV(ctx ml.Context, b *Backend,
 			C.int(firstCell),
 			C.int(kBits),
 			C.int(vBits),
+			kOutlPackedT,
+			kOutlScalesT,
+			kOutlIndicesT,
+			kOutlCbT,
+			kZerosT,
+			kOutlZerosT,
+			C.int32_t(outlierBits),
+			C.int32_t(outlierCount),
 		),
 	}
 }

@@ -399,6 +399,8 @@ __global__ void tq_dequant_v_rotated_kernel(
 // Combined K+V dequant: two back-to-back kernel launches in a single GGML op.
 // Output: [headDim, numKVHeads, nCells, 2] f16 — K at ne[3]=0, V at ne[3]=1.
 // When src[6] (v_rotation) is non-NULL, V is dequanted with rotation fused.
+// When K outlier sources (src[7..12]) are non-NULL, K plane uses the
+// regular+outlier overwrite kernel; V is always plain dequant (no outliers).
 void ggml_cuda_tq_dequant_kv(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_info().devices[ctx.device].cc >= 600 &&
                 "TurboQuant dequant requires compute capability 6.0+ (Pascal or newer)");
@@ -409,17 +411,24 @@ void ggml_cuda_tq_dequant_kv(ggml_backend_cuda_context & ctx, struct ggml_tensor
     const struct ggml_tensor * v_scales   = dst->src[4];
     const struct ggml_tensor * v_cb       = dst->src[5];
     const struct ggml_tensor * v_rotation __attribute__((unused)) = dst->src[6];  // NULL = no rotation fusion
+    const struct ggml_tensor * k_outl_packed   = dst->src[7];   // NULL when no outliers
+    const struct ggml_tensor * k_outl_scales   = dst->src[8];
+    const struct ggml_tensor * k_outl_indices  = dst->src[9];
+    const struct ggml_tensor * k_outl_codebook = dst->src[10];
+    const struct ggml_tensor * k_zeros         = dst->src[11];  // NULL when symmetric
+    const struct ggml_tensor * k_outl_zeros    = dst->src[12];
 
     const int headDim    = (int)dst->ne[0];
     const int numKVHeads = (int)dst->ne[1];
     const int nCells     = (int)dst->ne[2];
 
-    int32_t k_bits, v_bits, firstCell;
-    memcpy(&k_bits,    (const int32_t *)dst->op_params + 0, sizeof(int32_t));
-    memcpy(&v_bits,    (const int32_t *)dst->op_params + 1, sizeof(int32_t));
-    memcpy(&firstCell, (const int32_t *)dst->op_params + 2, sizeof(int32_t));
+    int32_t k_bits, v_bits, firstCell, outlier_bits, outlier_count;
+    memcpy(&k_bits,        (const int32_t *)dst->op_params + 0, sizeof(int32_t));
+    memcpy(&v_bits,        (const int32_t *)dst->op_params + 1, sizeof(int32_t));
+    memcpy(&firstCell,     (const int32_t *)dst->op_params + 2, sizeof(int32_t));
+    memcpy(&outlier_bits,  (const int32_t *)dst->op_params + 3, sizeof(int32_t));
+    memcpy(&outlier_count, (const int32_t *)dst->op_params + 4, sizeof(int32_t));
 
-    const int k_packed_bytes = (headDim * k_bits + 7) / 8;
     const int v_packed_bytes = (headDim * v_bits + 7) / 8;
 
     dim3 grid(nCells, numKVHeads);
@@ -433,14 +442,48 @@ void ggml_cuda_tq_dequant_kv(ggml_backend_cuda_context & ctx, struct ggml_tensor
 
     cudaStream_t stream = ctx.stream();
 
-    // K dequant → first plane (offset 0) — always unrotated
-    tq_dequant_multihead_kernel<<<grid, block_size, 0, stream>>>(
-        (const uint8_t *)k_encode->data,
-        (const float   *)k_scales->data,
-        (const float   *)k_cb->data,
-        out_base,
-        headDim, numKVHeads, k_bits, k_packed_bytes, (int)k_cb->ne[0], firstCell
-    );
+    // K dequant → first plane (offset 0) — always unrotated.
+    const bool k_has_outliers = (k_outl_packed != nullptr) && outlier_count > 0
+                                && outlier_bits > 0 && outlier_count < headDim;
+    if (k_has_outliers) {
+        const int regular_count    = headDim - outlier_count;
+        const int reg_packed_raw   = (regular_count * k_bits + 7) / 8;
+        const int reg_packed_bytes = (reg_packed_raw + 3) & ~3;
+        const int out_packed_raw   = (outlier_count * outlier_bits + 7) / 8;
+        const int out_packed_bytes = (out_packed_raw + 3) & ~3;
+        const int mask_words       = (headDim + 31) >> 5;
+        const size_t smem = (size_t)headDim * sizeof(int8_t)
+                          + (size_t)mask_words * sizeof(uint32_t);
+
+        tq_dequant_multihead_kernel_outlier<<<grid, block_size, smem, stream>>>(
+            (const uint8_t *)k_encode->data,
+            (const float   *)k_scales->data,
+            (const float   *)k_cb->data,
+            (const uint8_t *)k_outl_packed->data,
+            (const float   *)k_outl_scales->data,
+            (const uint8_t *)k_outl_indices->data,
+            (const float   *)k_outl_codebook->data,
+            out_base,
+            headDim, numKVHeads, k_bits, reg_packed_bytes,
+            outlier_bits, outlier_count, out_packed_bytes, firstCell,
+            k_zeros      ? (const float *)k_zeros->data      : nullptr,
+            k_outl_zeros ? (const float *)k_outl_zeros->data : nullptr,
+            /* qjl_packed     = */ nullptr,
+            /* qjl_norm       = */ nullptr,
+            /* qjl_projection = */ nullptr,
+            /* qjlRows        = */ 0,
+            /* qjl_packed_bytes = */ 0
+        );
+    } else {
+        const int k_packed_bytes = (headDim * k_bits + 7) / 8;
+        tq_dequant_multihead_kernel<<<grid, block_size, 0, stream>>>(
+            (const uint8_t *)k_encode->data,
+            (const float   *)k_scales->data,
+            (const float   *)k_cb->data,
+            out_base,
+            headDim, numKVHeads, k_bits, k_packed_bytes, (int)k_cb->ne[0], firstCell
+        );
+    }
 
     // V dequant → second plane (offset plane_size). Plain dequant only — the
     // rotation undo (R @ attn_out) is handled by SDPA via mulmat, which is

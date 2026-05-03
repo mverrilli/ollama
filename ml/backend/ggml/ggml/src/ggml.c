@@ -7779,7 +7779,15 @@ struct ggml_tensor * ggml_tq_dequant_kv(
         struct ggml_tensor  * v_codebook,
         struct ggml_tensor  * v_rotation,
         int headDim, int numKVHeads, int nCells, int firstCell,
-        int k_bits, int v_bits) {
+        int k_bits, int v_bits,
+        struct ggml_tensor  * k_outlier_packed,
+        struct ggml_tensor  * k_outlier_scales,
+        struct ggml_tensor  * k_outlier_indices,
+        struct ggml_tensor  * k_outlier_codebook,
+        struct ggml_tensor  * k_zeros,
+        struct ggml_tensor  * k_outlier_zeros,
+        int32_t outlier_bits,
+        int32_t outlier_count) {
     // Output: [headDim, numKVHeads, nCells, 2] f16 — last dim separates K (0) and V (1).
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
                                                       headDim, numKVHeads, nCells, 2);
@@ -7790,10 +7798,18 @@ struct ggml_tensor * ggml_tq_dequant_kv(
     result->src[3] = v_encode_result;
     result->src[4] = v_scales;
     result->src[5] = v_codebook;
-    result->src[6] = v_rotation;  // NULL = no rotation fusion
+    result->src[6] = v_rotation;          // NULL = no rotation fusion
+    result->src[7]  = k_outlier_packed;   // NULL when no outliers
+    result->src[8]  = k_outlier_scales;
+    result->src[9]  = k_outlier_indices;
+    result->src[10] = k_outlier_codebook;
+    result->src[11] = k_zeros;            // NULL when symmetric
+    result->src[12] = k_outlier_zeros;    // NULL when symmetric
     ggml_set_op_params_i32(result, 0, (int32_t)k_bits);
     ggml_set_op_params_i32(result, 1, (int32_t)v_bits);
     ggml_set_op_params_i32(result, 2, (int32_t)firstCell);
+    ggml_set_op_params_i32(result, 3, outlier_bits);
+    ggml_set_op_params_i32(result, 4, outlier_count);
     return result;
 }
 

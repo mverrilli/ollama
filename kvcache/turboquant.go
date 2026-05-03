@@ -4,12 +4,18 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 	"sync"
 
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model/input"
 	"github.com/ollama/ollama/turboquant"
 )
+
+// disableFusedKV is a debug toggle for routing experiments. When set, the
+// router skips path 2 (K+V fused inline-decode) so K+V presets fall through
+// to path 5 (separate DequantK + DequantV + stock FA) — same path tq3k uses.
+var disableFusedKV = os.Getenv("OLLAMA_TQ_DISABLE_FUSED_KV") != ""
 
 type TurboQuantCache struct {
 	meta      *Causal
@@ -484,13 +490,9 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 		// routes independently of preferFusedAttn so CUDA (preferFusedAttn=
 		// false) continues to take path 1 for everything.
 		//
-		// Outlier presets skip DequantKV: Metal's kernel_tq_dequant (used by
-		// the DequantKV op for both K and V planes) decodes a single packed
-		// buffer per cell — it doesn't know about regular_packed +
-		// outlier_packed split. The slow K+V path (separate DequantK +
-		// DequantV → stock FA) routes K through kernel_tq_dequant_outlier
-		// which handles the split correctly.
-		useDequantKVForPrefill := c.preferFusedAttn && c.curQueryLen > 1 && !c.preset.HasOutlierSplit()
+		// DequantKV is outlier-aware: when m.hasOutliers() the K plane uses
+		// the regular+outlier overwrite kernel, V plane is plain dequant.
+		useDequantKVForPrefill := c.preferFusedAttn && c.curQueryLen > 1
 
 		// 1. Combined K+V dequant → stock FA.
 		//    Metal prefill only (batched Q decodes each K cell once; stock FA
@@ -515,7 +517,7 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 		// 2. K+V fused inline-decode: reads packed K+V directly, no f16 intermediate.
 		//    Primary path on CUDA/ROCm and Metal decode (Q=1).
 		//    CUDA: D=64, 128, 256. Metal: D=128, 256.
-		if vEncodeResult != nil && c.fusedFallbackEligible {
+		if vEncodeResult != nil && c.fusedFallbackEligible && !disableFusedKV {
 			if tqkv, ok := c.compressedK.GetAsTQTensorKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells); ok {
 				c.logPathOnce[2].Do(func() {
 					if c.preferFusedAttn {
@@ -530,10 +532,12 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 			}
 		}
 
-		// 1b. DequantKV fallback when Metal decode tried path 2 and the fused
-		//     path was unavailable (e.g. headDim outside 128/256). Skipped for
-		//     outlier presets — see useDequantKVForPrefill comment above.
-		if vEncodeResult != nil && c.preferFusedAttn && !c.preset.HasOutlierSplit() {
+		// 1b. DequantKV fallback when path 2 was unavailable. Used by:
+		//     - Metal decode when fused unavailable (preferFusedAttn).
+		//     - CUDA with disableFusedKV: combined dequant is one scheduler op
+		//       and one allocation vs path 5's two; outlier-aware via the K
+		//       overwrite kernel.
+		if vEncodeResult != nil && (c.preferFusedAttn || disableFusedKV) {
 			key, value := c.compressedK.DequantKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells)
 			if key != nil && value != nil {
 				c.logPathOnce[1].Do(func() {
@@ -553,7 +557,7 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 
 		// 4. Try K-only fused: K decoded inline, V is dequanted f16. Gated on
 		//    fusedFallbackEligible for the same D=128 reason as path 2.
-		if c.fusedFallbackEligible {
+		if c.fusedFallbackEligible && !disableFusedKV {
 			if tqk, ok := c.compressedK.GetAsTQTensor(ctx, layer, encodeResult, firstCell, nCells); ok {
 				c.logPathOnce[3].Do(func() {
 					slog.Warn("turboquant: falling back to K-only inline-decode fused kernel")
