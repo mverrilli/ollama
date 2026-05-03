@@ -414,25 +414,8 @@ const (
 	DTypeTQ3
 	DTypeTQ3K
 	DTypeTQ2K
-	DTypeTQ3A
-	DTypeTQ3KA
-	DTypeTQ2A
-	DTypeTQ2KA
-	DTypeTQ3QA
-
-	DTypeTQ2QA
 	DTypeTQ4
 	DTypeTQ4K
-	DTypeTQ4A
-	DTypeTQ4KA
-	DTypeTQ4QA
-
-	// Per-group asymmetric integer quantization without rotation.
-	// q8k: int8 K-only; q8kv: int8 K+V; q4k: int4 K-only; q4kv: int4 K+V.
-	DTypeQ8K
-	DTypeQ8KV
-	DTypeQ4K
-	DTypeQ4KV
 )
 
 // TQCompressedKManager manages GPU-resident packed N-bit key indices for
@@ -490,48 +473,6 @@ type TQCompressedKManager interface {
 
 	// Close frees all GPU buffers.
 	Close()
-}
-
-// Q8KCompressedKManager manages GPU-resident per-group int8 (q8k) or int4
-// (q4k) packed key tensors. Unlike TQCompressedKManager it requires no
-// rotation matrix or codebook — compression and decompression are plain
-// per-group affine (scale + min) operations.
-type Q8KCompressedKManager interface {
-	// EnsureLayer allocates per-layer GPU tensors (packed, scales, mins) on
-	// first use. capacity = total cache cell count for this layer.
-	EnsureLayer(layer, capacity int)
-
-	// EncodeK creates a graph node that encodes key vectors into the persistent
-	// compressed buffer. Returns a view of the packed buffer.
-	EncodeK(ctx Context, layer int, key Tensor, firstCell int) Tensor
-
-	// DequantK creates a graph node returning [headDim, numKVHeads, nCells] f16.
-	DequantK(ctx Context, layer int, encodeResult Tensor, firstCell, nCells int) Tensor
-
-	// GetAsQ8KTensor returns a wrapper tensor for the fused flash-attention
-	// kernel that decodes K inline. Returns (nil, false) when fused is not
-	// supported (e.g. headDim != 128).
-	GetAsQ8KTensor(ctx Context, layer int, encodeResult Tensor, firstCell, nCells int) (Tensor, bool)
-
-	// EnsureVLayer allocates per-layer V packed/scales/mins tensors.
-	EnsureVLayer(layer, capacity int)
-
-	// EncodeV creates a graph node encoding value vectors.
-	EncodeV(ctx Context, layer int, value Tensor, firstCell int) Tensor
-
-	// DequantV creates a graph node returning [headDim, numKVHeads, nCells] f16.
-	DequantV(ctx Context, layer int, encodeResult Tensor, firstCell, nCells int) Tensor
-
-	// Close frees all GPU buffers.
-	Close()
-}
-
-// Q8KCompressedKBackend is implemented by backends that support per-group
-// int8/int4 compressed K/V caches (q8k/q8kv/q4k/q4kv presets).
-// is4Bit selects nibble packing (int4) vs full-byte (int8).
-// withV enables V compression in addition to K.
-type Q8KCompressedKBackend interface {
-	NewQ8KCompressedKManager(headDim, numKVHeads int, is4Bit, withV bool) Q8KCompressedKManager
 }
 
 // TQCompressedKBackend is implemented by backends that support TQ compressed K.

@@ -69,7 +69,12 @@ func TestMemoryFormulaMatchesMarshalSize(t *testing.T) {
 		regularValueBits := uint64(tc.preset.ValueBits)
 		dim := uint64(tc.dim)
 		outlierData := (outlierCount*outlierBits + 7) / 8
-		qjlData := (outlierCount + 7) / 8
+		// QJL data is included only when QJLRowsDivisor > 0 (no ship preset
+		// uses QJL — the formula stays so test-only QJL fixtures stay valid).
+		qjlData := uint64(0)
+		if tc.preset.QJLRowsDivisor > 0 {
+			qjlData = (outlierCount + 7) / 8
+		}
 		bitmap := 2 * ((dim + 7) / 8) // one per sub-block
 		// Fixed-overhead constant per encoded vector with outlier split: 10
 		// bytes of EncodedVector header + 4 bytes blockLen per block (×2) +
@@ -200,11 +205,14 @@ func TestEncodeVectorDeterministicBytes(t *testing.T) {
 
 func TestEncodeKeyAndValueUseDifferentObjectives(t *testing.T) {
 	values := pseudoRandomVector(32, 0x77)
-	keyEncoded, err := EncodeKeyVector(values, PresetTQ3)
+	// QJL-enabled inline preset: ship presets set QJLRowsDivisor=0, so a
+	// dedicated fixture is needed to exercise the residual-sketch code path.
+	qjlOn := newPreset(100, "qjl_on", 3, 3, 1, 0x35c0ffee, 4, 0)
+	keyEncoded, err := EncodeKeyVector(values, qjlOn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	valueEncoded, err := EncodeValueVector(values, PresetTQ3)
+	valueEncoded, err := EncodeValueVector(values, qjlOn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,8 +233,8 @@ func TestEncodeKeyAndValueUseDifferentObjectives(t *testing.T) {
 func TestPresetNames(t *testing.T) {
 	// User-facing presets routable via OLLAMA_KV_CACHE_TYPE.
 	for _, name := range []string{
-		"tq2", "tq3", "tq3k", "tq2k", // shipped baseline
-		"tq3qa", "tq2qa", // Qwen-2 recovery
+		"tq2", "tq3", "tq4",
+		"tq2k", "tq3k", "tq4k",
 	} {
 		preset, err := PresetByName(name)
 		if err != nil {
@@ -237,35 +245,35 @@ func TestPresetNames(t *testing.T) {
 		}
 	}
 
-	// Internal-only presets (single-mechanism intermediates) must NOT be
-	// reachable via PresetByName — they're test/ablation helpers reachable
-	// only as exported package vars. The stacked *qa combinations dominate
-	// them on the target distribution, so the user-facing surface filters
-	// them out.
+	// Names dropped in the 6-preset consolidation must NOT resolve. The
+	// equivalent ablations are now reachable via OLLAMA_TQ_DISABLE_OUTLIERS
+	// and OLLAMA_TQ_DISABLE_ASYMMETRIC env vars.
 	for _, name := range []string{
-		"tq3a", "tq3ka", "tq3q", "tq3kq",
-		"tq2a", "tq2ka", "tq2q", "tq2kq",
+		"tq3a", "tq3ka", "tq3q", "tq3kq", "tq3qa", "tq3kqa",
+		"tq2a", "tq2ka", "tq2q", "tq2kq", "tq2qa", "tq2kqa",
+		"tq4a", "tq4ka", "tq4qa",
 	} {
 		if _, err := PresetByName(name); err == nil {
-			t.Errorf("internal-only preset %q should not be reachable via PresetByName", name)
+			t.Errorf("retired preset %q must not resolve via PresetByName", name)
 		}
 	}
 }
 
-// TestQJLDimMatchesPaperSpec verifies that the QJL sketch uses d random
-// projections (one per dimension), matching the paper's specification in
-// arXiv 2504.19874. With QJLRowsDivisor=1 this ensures the estimator variance
-// matches the paper's theoretical analysis and the bit accounting is exact:
-// tq2 = 2.5 bits/elem avg, tq3 = 3.5 bits/elem avg.
+// TestQJLDimMatchesPaperSpec verifies that a QJL-enabled preset (constructed
+// inline — no shipping preset uses QJL) sketches d random projections,
+// matching arXiv:2504.19874's spec. The shipping tq* presets set
+// QJLRowsDivisor=0, so the math is exercised here by direct construction.
 func TestQJLDimMatchesPaperSpec(t *testing.T) {
+	tq2qjl := newPreset(110, "tq2_qjl", 2, 2, 1, 0x25c0ffee, 3, 0)
+	tq3qjl := newPreset(100, "tq3_qjl", 3, 3, 1, 0x35c0ffee, 4, 0)
 	cases := []struct {
 		preset Preset
 		dim    int
 	}{
-		{PresetTQ2, 64},
-		{PresetTQ2, 128},
-		{PresetTQ3, 128},
-		{PresetTQ3, 256},
+		{tq2qjl, 64},
+		{tq2qjl, 128},
+		{tq3qjl, 128},
+		{tq3qjl, 256},
 	}
 	for _, tc := range cases {
 		got := tc.preset.KeyQJLRows(tc.dim)

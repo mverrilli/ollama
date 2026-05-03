@@ -25,15 +25,10 @@ func TestSmokeAllKVCacheTypes(t *testing.T) {
 		{"q4_0", ml.DTypeQ40, "", true, true},
 		{"tq2", ml.DTypeTQ2, "tq2", true, true},
 		{"tq3", ml.DTypeTQ3, "tq3", true, true},
+		{"tq4", ml.DTypeTQ4, "tq4", true, true},
 		{"tq2k", ml.DTypeTQ2K, "tq2k", false, true},
 		{"tq3k", ml.DTypeTQ3K, "tq3k", false, true},
-		{"tq3qa", ml.DTypeTQ3QA, "tq3qa", true, true},
-		{"tq2qa", ml.DTypeTQ2QA, "tq2qa", true, true},
-		{"tq4", ml.DTypeTQ4, "tq4", true, true},
 		{"tq4k", ml.DTypeTQ4K, "tq4k", false, true},
-		{"tq4a", ml.DTypeTQ4A, "tq4a", true, true},
-		{"tq4ka", ml.DTypeTQ4KA, "tq4ka", true, true},
-		{"tq4qa", ml.DTypeTQ4QA, "tq4qa", true, true},
 	}
 
 	var g ggml.GGML
@@ -80,7 +75,13 @@ func TestSmokeAllKVCacheTypes(t *testing.T) {
 // TestSmokeRejectsUnknown verifies we don't accidentally widen acceptance.
 func TestSmokeRejectsUnknown(t *testing.T) {
 	var g ggml.GGML
-	for _, name := range []string{"tq3q", "tq2q", "banana"} {
+	for _, name := range []string{
+		"tq3a", "tq3ka", "tq3q", "tq3qa",
+		"tq2a", "tq2ka", "tq2q", "tq2qa",
+		"tq4a", "tq4ka", "tq4qa",
+		"q8k", "q8kv", "q4k", "q4kv",
+		"banana",
+	} {
 		if g.SupportsKVCacheType(name) {
 			t.Errorf("SupportsKVCacheType(%q) = true; internal-only / invalid names must reject", name)
 		}

@@ -29,8 +29,8 @@ type Block struct {
 	ChannelBitmap []byte // ceil(fullDim/8) bytes; empty for single-block vectors
 	Scale         float32
 	// Zero is the per-block centring offset for asymmetric-primary presets.
-	// Symmetric presets (tq2/tq3/tq2k/tq3k, tq3q/tq3kq) write 0. Decoding is
-	// unconditional: x̂ = codebook[idx] * Scale + Zero.
+	// Symmetric blocks (set via OLLAMA_TQ_DISABLE_ASYMMETRIC=1) write 0.
+	// Decoding is unconditional: x̂ = codebook[idx] * Scale + Zero.
 	Zero           float32
 	RegularIndices []byte
 	Residual       ResidualSketch

@@ -23,16 +23,27 @@ import (
 //
 // The test runs only when a TQ-capable GPU is present (skips otherwise).
 func TestAsymmetricQJLGPURoundtripFidelity(t *testing.T) {
+	// Inline-construct asym+outliers+QJL presets at 3-bit and 2-bit. These
+	// are not shipping presets but exercise the GPU encode/decode path in
+	// the same configuration the test was originally written against.
+	tq3qa := turboquant.Preset{
+		ID: 103, Name: "tq3qa", RotationSeed: 0x35c0ffee,
+		KeyPrimaryBits: 3, ValueBits: 3, QJLRowsDivisor: 1,
+		OutlierBits: 4, OutlierCount: 32, AsymmetricPrimary: true,
+	}
+	tq2qa := turboquant.Preset{
+		ID: 113, Name: "tq2qa", RotationSeed: 0x25c0ffee,
+		KeyPrimaryBits: 2, ValueBits: 2, QJLRowsDivisor: 1,
+		OutlierBits: 3, OutlierCount: 32, AsymmetricPrimary: true,
+	}
 	cases := []struct {
 		name    string
 		preset  turboquant.Preset
 		vBits   int
 		headDim int
 	}{
-		// tq3qa: 3-bit K + V, asymmetric primary + QJL residual, outlier=32.
-		{"tq3qa_d128_h8", turboquant.PresetTQ3QA, 3, 128},
-		// tq2qa: 2-bit K + V.
-		{"tq2qa_d128_h8", turboquant.PresetTQ2QA, 2, 128},
+		{"tq3qa_d128_h8", tq3qa, 3, 128},
+		{"tq2qa_d128_h8", tq2qa, 2, 128},
 	}
 
 	for _, tc := range cases {

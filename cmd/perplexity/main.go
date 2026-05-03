@@ -10,7 +10,7 @@
 //	  ./dist/bin/perplexity --model path/to/model.gguf --preset f16 --ctx 512
 //
 //	# compare presets:
-//	for p in f16 q8_0 q8k q8kv q4k q4kv tq2 tq3 tq4 tq2k tq3k tq4k tq3qa tq2qa tq4qa; do
+//	for p in f16 q8_0 tq2 tq3 tq4 tq2k tq3k tq4k; do
 //	  cat text.txt | OLLAMA_LIBRARY_PATH=./build/lib/ollama \
 //	    ./dist/bin/perplexity --model model.gguf --preset $p
 //	done
@@ -64,36 +64,10 @@ func kvDTypeFromStr(s string) ml.DType {
 		return ml.DTypeTQ3K
 	case "tq2k":
 		return ml.DTypeTQ2K
-	case "tq3a":
-		return ml.DTypeTQ3A
-	case "tq3ka":
-		return ml.DTypeTQ3KA
-	case "tq2a":
-		return ml.DTypeTQ2A
-	case "tq2ka":
-		return ml.DTypeTQ2KA
-	case "tq3qa":
-		return ml.DTypeTQ3QA
-	case "tq2qa":
-		return ml.DTypeTQ2QA
 	case "tq4":
 		return ml.DTypeTQ4
 	case "tq4k":
 		return ml.DTypeTQ4K
-	case "tq4a":
-		return ml.DTypeTQ4A
-	case "tq4ka":
-		return ml.DTypeTQ4KA
-	case "tq4qa":
-		return ml.DTypeTQ4QA
-	case "q8k":
-		return ml.DTypeQ8K
-	case "q8kv":
-		return ml.DTypeQ8KV
-	case "q4k":
-		return ml.DTypeQ4K
-	case "q4kv":
-		return ml.DTypeQ4KV
 	default:
 		return ml.DTypeF16
 	}
@@ -222,7 +196,7 @@ func runForward(m model.Model, inToks []int32, positions []int32, outPositions [
 
 func main() {
 	modelPath := flag.String("model", "", "path to GGUF model file (required)")
-	preset := flag.String("preset", "f16", "KV cache preset (f16, tq2, tq3, tq4, tq*k, tq*a, tq*ka, tq*qa, ...)")
+	preset := flag.String("preset", "f16", "KV cache preset (f16, q8_0, q4_0, tq2, tq3, tq4, tq2k, tq3k, tq4k)")
 	ctxLen := flag.Int("ctx", 512, "context window in tokens (KV cache capacity per chunk)")
 	maxBatch := flag.Int("max-batch", 512, "physical batch size for prefill (sizes the compute graph; must be ≤ ctx)")
 	gpuLayers := flag.Int("gpu-layers", 200, "number of layers to offload to GPU (0 = CPU only)")
@@ -297,7 +271,7 @@ func main() {
 	if cache != nil && *preset != "f16" {
 		dt := kvDTypeFromStr(*preset)
 		if p, ok := kvcache.PresetFromDType(dt); ok {
-			// TQ / q8k / q4k path: wrap with TurboQuantCache.
+			// TurboQuant path: wrap with TurboQuantCache.
 			wrapped, active := kvcache.WrapWithTurboQuant(cache, p)
 			if active {
 				cache = wrapped

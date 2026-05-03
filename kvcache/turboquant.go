@@ -85,16 +85,6 @@ type TurboQuantCache struct {
 	// once the manager is created.
 	pendingKBiases map[int]ml.Tensor
 
-	// compressedQ8K is the per-group int8/int4 GPU manager for q8k/q8kv/q4k/q4kv
-	// presets. Mutually exclusive with compressedK (TQ codebook path).
-	compressedQ8K ml.Q8KCompressedKManager
-
-	// q8kEncodeResults and q8kVEncodeResults store per-layer encode result
-	// tensors for the current forward pass (parallel to encodeResults/vEncodeResults
-	// but for the q8k path).
-	q8kEncodeResults  map[int]ml.Tensor
-	q8kVEncodeResults map[int]ml.Tensor
-
 	// reserveSkipVPlaceholder, when true, suppresses the SkipV synthesis block
 	// in the reserve graph for the current Get() call. Set when the K reserve
 	// branch placed a K+V fused tensor (which carries V internally as vPacked,
@@ -154,10 +144,8 @@ func WrapWithTurboQuant(cache Cache, preset turboquant.Preset) (Cache, bool) {
 		return &TurboQuantCache{
 			meta:              c,
 			preset:            preset,
-			encodeResults:     make(map[int]ml.Tensor),
-			vEncodeResults:    make(map[int]ml.Tensor),
-			q8kEncodeResults:  make(map[int]ml.Tensor),
-			q8kVEncodeResults: make(map[int]ml.Tensor),
+			encodeResults:  make(map[int]ml.Tensor),
+			vEncodeResults: make(map[int]ml.Tensor),
 		}, true
 
 	case *WrapperCache:
@@ -171,12 +159,10 @@ func WrapWithTurboQuant(cache Cache, preset turboquant.Preset) (Cache, bool) {
 				continue
 			}
 			c.caches[i] = &TurboQuantCache{
-				meta:              inner,
-				preset:            preset,
-				encodeResults:     make(map[int]ml.Tensor),
-				vEncodeResults:    make(map[int]ml.Tensor),
-				q8kEncodeResults:  make(map[int]ml.Tensor),
-				q8kVEncodeResults: make(map[int]ml.Tensor),
+				meta:           inner,
+				preset:         preset,
+				encodeResults:  make(map[int]ml.Tensor),
+				vEncodeResults: make(map[int]ml.Tensor),
 			}
 			wrapped++
 		}
@@ -199,12 +185,10 @@ func WrapWithTurboQuant(cache Cache, preset turboquant.Preset) (Cache, bool) {
 			return cache, false
 		}
 		c.SetAttentionKV(&TurboQuantCache{
-			meta:              inner,
-			preset:            preset,
-			encodeResults:     make(map[int]ml.Tensor),
-			vEncodeResults:    make(map[int]ml.Tensor),
-			q8kEncodeResults:  make(map[int]ml.Tensor),
-			q8kVEncodeResults: make(map[int]ml.Tensor),
+			meta:           inner,
+			preset:         preset,
+			encodeResults:  make(map[int]ml.Tensor),
+			vEncodeResults: make(map[int]ml.Tensor),
 		})
 		slog.Info("turboquant: wrapped attention KV in hybrid recurrent cache",
 			"preset", preset.Name)
@@ -232,10 +216,6 @@ func (c *TurboQuantCache) Close() {
 	if c.compressedK != nil {
 		c.compressedK.Close()
 		c.compressedK = nil
-	}
-	if c.compressedQ8K != nil {
-		c.compressedQ8K.Close()
-		c.compressedQ8K = nil
 	}
 	c.meta.Close()
 }
@@ -278,8 +258,6 @@ func (c *TurboQuantCache) StartForward(ctx ml.Context, batch input.Batch, reserv
 	c.curQueryLen = len(batch.Positions)
 	clear(c.encodeResults)
 	clear(c.vEncodeResults)
-	clear(c.q8kEncodeResults)
-	clear(c.q8kVEncodeResults)
 	return c.meta.StartForward(ctx, batch, reserve)
 }
 
@@ -309,25 +287,8 @@ func (c *TurboQuantCache) Put(ctx ml.Context, key, value ml.Tensor) {
 		// footprint. Also create the encode graph node so the reserve graph has
 		// the same K-branch structure as the inference graph. Without the encode
 		// node, gallocr's live-range analysis sees a truncated graph and
-		// over-allocates scratch (measured: +52 MiB for i4k, +222 MiB for tq*qa).
-		if c.compressedQ8K != nil {
-			layer := c.meta.curLayer
-			capacity := len(c.meta.cells)
-			c.compressedQ8K.EnsureLayer(layer, capacity)
-			kResult := c.compressedQ8K.EncodeK(ctx, layer, key, 0)
-			if kResult != nil {
-				ctx.Forward(kResult)
-				c.q8kEncodeResults[layer] = kResult
-			}
-			if c.preset.ValueBits > 0 {
-				c.compressedQ8K.EnsureVLayer(layer, capacity)
-				vResult := c.compressedQ8K.EncodeV(ctx, layer, value, 0)
-				if vResult != nil {
-					ctx.Forward(vResult)
-					c.q8kVEncodeResults[layer] = vResult
-				}
-			}
-		} else if c.compressedK != nil {
+		// over-allocates scratch (measured: +222 MiB for asym+outliers presets).
+		if c.compressedK != nil {
 			layer := c.meta.curLayer
 			capacity := len(c.meta.cells)
 			c.compressedK.EnsureLayer(layer, capacity)
@@ -359,27 +320,6 @@ func (c *TurboQuantCache) Put(ctx ml.Context, key, value ml.Tensor) {
 				panic(fmt.Sprintf("turboquant: non-contiguous cache slots %v — findLocs invariant violated", c.meta.curLocs))
 			}
 		}
-	}
-
-	if c.compressedQ8K != nil {
-		layer := c.meta.curLayer
-		capacity := len(c.meta.cells)
-		c.compressedQ8K.EnsureLayer(layer, capacity)
-		kResult := c.compressedQ8K.EncodeK(ctx, layer, key, firstCell)
-		if kResult != nil {
-			ctx.Forward(kResult)
-			c.q8kEncodeResults[layer] = kResult
-		}
-		if c.preset.ValueBits > 0 {
-			c.compressedQ8K.EnsureVLayer(layer, capacity)
-			vResult := c.compressedQ8K.EncodeV(ctx, layer, value, firstCell)
-			if vResult != nil {
-				ctx.Forward(vResult)
-				c.q8kVEncodeResults[layer] = vResult
-			}
-		}
-		c.meta.Put(ctx, key, value)
-		return
 	}
 
 	if c.compressedK != nil {
@@ -433,23 +373,7 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 			if c.meta.curMask != nil {
 				nCells = c.meta.curMask.Dim(0)
 			}
-			if c.compressedQ8K != nil {
-				layer := c.meta.curLayer
-				enc := c.q8kEncodeResults[layer]
-				if enc != nil {
-					if gpuKey, ok := c.compressedQ8K.GetAsQ8KTensor(ctx, layer, enc, 0, nCells); ok {
-						key = gpuKey
-					} else {
-						key = c.compressedQ8K.DequantK(ctx, layer, enc, 0, nCells)
-					}
-				}
-				if c.preset.ValueBits > 0 {
-					vEnc := c.q8kVEncodeResults[layer]
-					if vEnc != nil {
-						value = c.compressedQ8K.DequantV(ctx, layer, vEnc, 0, nCells)
-					}
-				}
-			} else if c.compressedK != nil {
+			if c.compressedK != nil {
 				layer := c.meta.curLayer
 				enc := c.encodeResults[layer]
 				switch {
@@ -481,8 +405,10 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 							value = c.compressedK.DequantV(ctx, layer, vEnc, 0, nCells)
 						}
 					}
-				case !c.preset.AsymmetricPrimary:
-					// tq2k/tq3k/tq4k: prefer fused K-only (no scratch); fall back to DequantK.
+				default:
+					// K-only (tq2k/tq3k/tq4k, with or without asymmetric): prefer
+					// fused K-only path (no f16 scratch); fall back to DequantK
+					// when fused is unavailable.
 					if enc != nil {
 						if gpuKey, ok := c.compressedK.GetAsTQTensor(ctx, layer, enc, 0, nCells); ok {
 							key = gpuKey
@@ -490,25 +416,18 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 							key = c.compressedK.DequantK(ctx, layer, enc, 0, nCells)
 						}
 					}
-				default:
-					// tq*ka: fused TQ kernel. Falls to DequantK if fused unavailable.
-					if gpuKey, ok := c.compressedK.GetAsTQTensor(ctx, layer, enc, 0, nCells); ok {
-						key = gpuKey
-					} else if enc != nil {
-						key = c.compressedK.DequantK(ctx, layer, enc, 0, nCells)
-					}
 				}
 			}
 			if key == nil {
 				key = ctx.Input().Zeros(ml.DTypeF16, c.headDim, c.numKVHeads, nCells)
 			}
 		}
-		// SkipV: synthesize V placeholder. For i4kv synthesise DequantV to match
-		// the inference path (path 3: DequantV f16 + path 4: fused K inline-decode).
-		// For K+V TQ presets value was already set above by DequantKV, so this
-		// block is a no-op for those. For K-only presets value comes from Causal.
-		// If the K block placed a K+V fused tensor (value=nil, V carried inline),
-		// skip this entire block — otherwise we reintroduce the f16 V scratch.
+		// SkipV: synthesize V placeholder when the K branch did not place a
+		// K+V fused tensor. For K+V TQ presets value was already set above by
+		// DequantKV, so this block is a no-op for those. For K-only presets
+		// value comes from Causal. If the K block placed a K+V fused tensor
+		// (value=nil, V carried inline), skip — otherwise we'd reintroduce
+		// the f16 V scratch.
 		skipVPlaceholder := c.reserveSkipVPlaceholder
 		c.reserveSkipVPlaceholder = false
 		if !skipVPlaceholder && value == nil && c.headDim > 0 {
@@ -523,51 +442,6 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 		return key, value, mask
 	}
 
-	if c.compressedQ8K != nil {
-		layer := c.meta.curLayer
-		firstCell := c.meta.curCellRange.min
-		nCells := c.meta.curMask.Dim(0)
-
-		encodeResult := c.q8kEncodeResults[layer]
-		vEncodeResult := c.q8kVEncodeResults[layer]
-
-		// q8k fused flash-attention path: decode K inline inside the kernel.
-		// Falls back to DequantK + stock FA when headDim != 128.
-		if encodeResult != nil {
-			if gpuKey, ok := c.compressedQ8K.GetAsQ8KTensor(ctx, layer, encodeResult, firstCell, nCells); ok {
-				c.logPathOnce[0].Do(func() {
-					slog.Info("q8k: using fused inline-decode flash-attention path")
-				})
-				_, metaValue, mask := c.meta.Get(ctx)
-				var value ml.Tensor
-				if vEncodeResult != nil {
-					// K+V: dequant V to f16 (no fused K+V kernel for q8k yet).
-					value = c.compressedQ8K.DequantV(ctx, layer, vEncodeResult, firstCell, nCells)
-				}
-				if value == nil {
-					value = metaValue
-				}
-				return gpuKey, value, mask
-			}
-		}
-		// Fallback: dequant K to f16 + stock FA.
-		c.logPathOnce[1].Do(func() {
-			slog.Info("q8k: using DequantK + f16 path (fused unavailable, headDim != 128)")
-		})
-		var key, value ml.Tensor
-		if encodeResult != nil {
-			key = c.compressedQ8K.DequantK(ctx, layer, encodeResult, firstCell, nCells)
-		}
-		if vEncodeResult != nil {
-			value = c.compressedQ8K.DequantV(ctx, layer, vEncodeResult, firstCell, nCells)
-		}
-		_, metaValue, mask := c.meta.Get(ctx)
-		if value == nil {
-			value = metaValue
-		}
-		return key, value, mask
-	}
-
 	if c.compressedK != nil {
 		layer := c.meta.curLayer
 		firstCell := c.meta.curCellRange.min
@@ -576,7 +450,8 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 		encodeResult := c.encodeResults[layer]
 		vEncodeResult := c.vEncodeResults[layer]
 
-		// 0. K-only symmetric presets (tq2k/tq3k/tq4k): fused K-only (no scratch).
+		// 0. K-only presets without asymmetric primary (tq2k/tq3k/tq4k under
+		//    OLLAMA_TQ_DISABLE_ASYMMETRIC=1): fused K-only (no scratch).
 		//    Falls back to DequantK only when fused is unavailable (D!=128).
 		if c.preset.ValueBits == 0 && !c.preset.AsymmetricPrimary && encodeResult != nil {
 			if c.fusedFallbackEligible {
@@ -697,40 +572,6 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 		return key, value, mask
 	}
 
-	if c.compressedQ8K != nil {
-		layer := c.meta.curLayer
-		firstCell := c.meta.curCellRange.min
-		nCells := c.meta.curMask.Dim(0)
-
-		enc := c.q8kEncodeResults[layer]
-		vEnc := c.q8kVEncodeResults[layer]
-
-		// K-only or K+V fused inline-decode path for q8k/q8kv/q4k/q4kv.
-		// V dequant (when preset.ValueBits > 0) uses separate DequantV.
-		var (
-			key   ml.Tensor
-			value ml.Tensor
-		)
-		if enc != nil {
-			if gpuKey, ok := c.compressedQ8K.GetAsQ8KTensor(ctx, layer, enc, firstCell, nCells); ok {
-				key = gpuKey
-			} else {
-				key = c.compressedQ8K.DequantK(ctx, layer, enc, firstCell, nCells)
-			}
-		}
-		if c.preset.ValueBits > 0 && vEnc != nil {
-			value = c.compressedQ8K.DequantV(ctx, layer, vEnc, firstCell, nCells)
-		}
-		if key == nil && enc != nil {
-			key = c.compressedQ8K.DequantK(ctx, layer, enc, firstCell, nCells)
-		}
-		_, metaValue, mask := c.meta.Get(ctx)
-		if value == nil {
-			value = metaValue
-		}
-		return key, value, mask
-	}
-
 	return c.meta.Get(ctx)
 }
 
@@ -753,54 +594,9 @@ func (c *TurboQuantCache) armRotationForNextSDPA() {
 	}
 }
 
-// activateQ8KEncode initialises the per-group int8/int4 GPU manager for
-// q8k/q8kv/q4k/q4kv presets. No rotation matrix or codebook is needed.
-func (c *TurboQuantCache) activateQ8KEncode() {
-	fallbackToF16 := func() {
-		c.meta.SkipK = false
-		c.meta.SkipV = false
-	}
-
-	is4Bit := c.preset.Scheme == turboquant.SchemeQ4K
-	withV := c.preset.ValueBits > 0
-
-	q8kb, ok := c.meta.backend.(ml.Q8KCompressedKBackend)
-	if !ok {
-		slog.Warn("q8k: backend does not support Q8K compressed KV cache; falling back to f16",
-			"preset", c.preset.Name)
-		fallbackToF16()
-		return
-	}
-
-	mgr := q8kb.NewQ8KCompressedKManager(c.headDim, c.numKVHeads, is4Bit, withV)
-	if mgr == nil {
-		slog.Warn("q8k: GPU manager creation failed; falling back to f16",
-			"preset", c.preset.Name)
-		fallbackToF16()
-		return
-	}
-
-	c.compressedQ8K = mgr
-	slog.Info("TQ_ACTIVATION",
-		"preset", c.preset.Name,
-		"gpu_active", true,
-		"path", "gpu-native",
-	)
-	slog.Info("q8k: GPU-native encode active",
-		"headDim", c.headDim, "numKVHeads", c.numKVHeads,
-		"is4Bit", is4Bit, "withV", withV)
-}
-
 // activateGPUEncode initialises the TQ compressed-K manager if the backend
 // supports it and re-enables Q rotation (stored K is in rotated space).
 func (c *TurboQuantCache) activateGPUEncode() {
-	// For per-group integer presets (q8k/q4k), use the lighter-weight Q8K path
-	// that requires no rotation matrix or codebook.
-	if c.preset.Scheme == turboquant.SchemeQ8K || c.preset.Scheme == turboquant.SchemeQ4K {
-		c.activateQ8KEncode()
-		return
-	}
-
 	// fallbackToF16 un-skips K/V on the inner Causal so subsequent Put/Get
 	// on this cache store and read f16 tensors like an ordinary non-TQ cache.
 	// Init() sets SkipK/SkipV unconditionally, so any failure to activate GPU
@@ -814,13 +610,10 @@ func (c *TurboQuantCache) activateGPUEncode() {
 	}
 
 	// QJL residual is only algorithmically active when the preset also uses
-	// outlier split (see turboquant.encodeVectorWithOutliers). The shipped
-	// presets tq2/tq3/tq2k/tq3k have QJLRowsDivisor=1 at the algorithm
-	// layer but outlierCount=0 — i.e. they do NOT use QJL at runtime.
-	// Passing a nonzero qjlRows to the GPU manager in those cases would
-	// trigger the "measurement-grade, needs CUDA+outliers" guard and cause
-	// a silent f16 fallback. Gate the effective runtime qjlRows on
-	// HasOutlierSplit to match the algorithm layer.
+	// outlier split (see turboquant.encodeVectorWithOutliers). The 6 ship
+	// presets all have QJLRowsDivisor=0 (no QJL); the runtime computation
+	// stays here so test-only Preset values that opt into QJL still work
+	// through this path.
 	qjlRows := 0
 	if c.preset.HasOutlierSplit() {
 		qjlRows = c.preset.KeyQJLRows(c.headDim)
@@ -848,6 +641,22 @@ func (c *TurboQuantCache) activateGPUEncode() {
 		)
 	}
 
+	// Architectural compatibility gate: the TQ encode kernel and fused fattn
+	// templates only handle headDim ∈ {64, 128, 256}. Models outside this set
+	// (e.g. glm-4.7 / DeepSeek-MLA at headDim=576) must skip TQ entirely and
+	// stay on f16 — the slow DequantK fallback also relies on encoder kernels
+	// that assume those dims. Stock ggml's quantized KV (Q4_0/Q8_0) already
+	// has the same restriction; this matches that behavior.
+	if c.headDim != 64 && c.headDim != 128 && c.headDim != 256 {
+		slog.Warn("turboquant: headDim not supported, falling back to f16 KV cache",
+			"preset", c.preset.Name,
+			"headDim", c.headDim,
+			"supported", "{64, 128, 256}")
+		logActivation(false, "f16-fallback-headdim-unsupported")
+		fallbackToF16()
+		return
+	}
+
 	tqb, ok := c.meta.backend.(ml.TQCompressedKBackend)
 	if !ok {
 		logActivation(false, "f16-fallback-no-tq-backend")
@@ -866,7 +675,7 @@ func (c *TurboQuantCache) activateGPUEncode() {
 	)
 	if mgr == nil {
 		if measurementRequested {
-			slog.Error("turboquant: MEASUREMENT PRESET REQUESTED BUT GPU UNAVAILABLE — SILENT F16 FALLBACK ACTIVE. Set OLLAMA_KV_CACHE_TYPE to a non-measurement preset (tq3k/tq3/tq2k/tq2) or run on a CUDA GPU.",
+			slog.Error("turboquant: GPU manager unavailable — SILENT F16 FALLBACK ACTIVE. Run on CUDA, or set OLLAMA_TQ_DISABLE_ASYMMETRIC=1 / OLLAMA_TQ_DISABLE_OUTLIERS=1 to drop to a backend-supported configuration.",
 				"preset", c.preset.Name,
 				"asymmetric", c.preset.AsymmetricPrimary,
 				"qjl_rows", qjlRows)
@@ -902,16 +711,10 @@ func (c *TurboQuantCache) activateGPUEncode() {
 		}
 	}
 
-	// The inline-decode fused-FA fallback paths (Get paths 2 and 4) dispatch
-	// to a kernel instantiated at D=64, 128, 256 on CUDA, ROCm, and Metal.
-	// Models with D=512 or other unsupported dims (e.g. gemma4 D=512) must
-	// skip these fallbacks; path 5 (DequantK + stock FA) handles them.
-	c.fusedFallbackEligible = c.headDim == 64 || c.headDim == 128 || c.headDim == 256
-	if !c.fusedFallbackEligible {
-		reason := "headDim not in {64, 128, 256}"
-		slog.Warn("turboquant: inline-decode fused-FA fallback paths DISABLED — slow DequantK path active; VRAM and throughput will regress",
-			"reason", reason, "headDim", c.headDim)
-	}
+	// The headDim ∈ {64, 128, 256} gate at the top of this function ensures
+	// we only get here on supported dims, so the fused-FA fallback paths
+	// (Get paths 2 and 4) are always eligible.
+	c.fusedFallbackEligible = true
 
 	// Cache the rotation matrices and the backend's rotation-setter hook on
 	// TurboQuantCache so Get() can arm them per-call without re-running a
@@ -972,46 +775,23 @@ func (c *TurboQuantCache) SetCausal(ctx ml.Context, opts CausalOptions) {
 	c.meta.SetCausal(ctx, opts)
 }
 
+// PresetFromDType resolves a runtime KV-cache DType to a turboquant.Preset.
+// Returned presets pass through ApplyEnvOverrides so OLLAMA_TQ_DISABLE_*
+// takes effect in the cache encode/decode path.
 func PresetFromDType(dtype ml.DType) (turboquant.Preset, bool) {
 	switch dtype {
 	case ml.DTypeTQ2:
-		return turboquant.PresetTQ2, true
+		return turboquant.ApplyEnvOverrides(turboquant.PresetTQ2), true
 	case ml.DTypeTQ3:
-		return turboquant.PresetTQ3, true
+		return turboquant.ApplyEnvOverrides(turboquant.PresetTQ3), true
 	case ml.DTypeTQ3K:
-		return turboquant.PresetTQ3K, true
+		return turboquant.ApplyEnvOverrides(turboquant.PresetTQ3K), true
 	case ml.DTypeTQ2K:
-		return turboquant.PresetTQ2K, true
-	case ml.DTypeTQ3A:
-		return turboquant.PresetTQ3A, true
-	case ml.DTypeTQ3KA:
-		return turboquant.PresetTQ3KA, true
-	case ml.DTypeTQ2A:
-		return turboquant.PresetTQ2A, true
-	case ml.DTypeTQ2KA:
-		return turboquant.PresetTQ2KA, true
-	case ml.DTypeTQ3QA:
-		return turboquant.PresetTQ3QA, true
-	case ml.DTypeTQ2QA:
-		return turboquant.PresetTQ2QA, true
+		return turboquant.ApplyEnvOverrides(turboquant.PresetTQ2K), true
 	case ml.DTypeTQ4:
-		return turboquant.PresetTQ4, true
+		return turboquant.ApplyEnvOverrides(turboquant.PresetTQ4), true
 	case ml.DTypeTQ4K:
-		return turboquant.PresetTQ4K, true
-	case ml.DTypeTQ4A:
-		return turboquant.PresetTQ4A, true
-	case ml.DTypeTQ4KA:
-		return turboquant.PresetTQ4KA, true
-	case ml.DTypeTQ4QA:
-		return turboquant.PresetTQ4QA, true
-	case ml.DTypeQ8K:
-		return turboquant.PresetQ8K, true
-	case ml.DTypeQ8KV:
-		return turboquant.PresetQ8KV, true
-	case ml.DTypeQ4K:
-		return turboquant.PresetQ4K, true
-	case ml.DTypeQ4KV:
-		return turboquant.PresetQ4KV, true
+		return turboquant.ApplyEnvOverrides(turboquant.PresetTQ4K), true
 	default:
 		return turboquant.Preset{}, false
 	}

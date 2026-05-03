@@ -164,10 +164,10 @@ func BenchmarkTQEncodeDequantAsymmetricQJLGPU(b *testing.B) {
 
 	mgrAny := ggmlBackend.NewTQCompressedKManager(
 		headDim, numKVHeads, bits,
-		turboquant.PresetTQ3QA.RotationSeed,
-		0, // vBits (K-only)
+		uint64(0x35c0ffee), // historical tq3qa rotation seed (preset retired)
+		0,                  // vBits (K-only)
 		outlierBits, outlierCount,
-		true,  // asymmetricPrimary
+		true, // asymmetricPrimary
 		qjlRows,
 	)
 	if mgrAny == nil {

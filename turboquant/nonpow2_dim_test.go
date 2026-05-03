@@ -28,7 +28,7 @@ import (
 // gates for these models belong in the runtime-plumbing PR.
 func TestEncodeNonPowerOfTwoHeadDims(t *testing.T) {
 	for _, headDim := range []int{192, 320, 576} {
-		for _, p := range []Preset{PresetTQ3, PresetTQ3QA, PresetTQ2QA} {
+		for _, p := range []Preset{PresetTQ3, PresetTQ2, PresetTQ4} {
 			t.Run(p.Name+"_d"+itoa(headDim), func(t *testing.T) {
 				rng := rand.New(rand.NewPCG(uint64(headDim)*0x9e3779b9, 0xbf58476d))
 				v := make([]float32, headDim)
