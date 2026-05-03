@@ -719,6 +719,12 @@ static __global__ void tq_flash_attn_ext_vec(
                     // Dual-stream zeros: regular zero applies to Σ_{d∈reg} Q[d]
                     // = sum_q[j] − sum_q_outl[j]; outlier zero applies to sum_q_outl[j].
                     if (asymmetric && (zeros || outlier_zeros)) {
+#ifdef GGML_USE_HIP
+                        // HIP compiler reorders sum_q_outl[j] reads past subsequent
+                        // warp-reduce shuffles, reading a stale accumulator on RDNA3.
+                        // A compiler fence prevents the reordering at zero HW cost.
+                        asm volatile("" ::: "memory");
+#endif
                         sum += reg_zero_val * (sum_q[j] - sum_q_outl[j])
                              + out_zero_val * sum_q_outl[j];
                     }
