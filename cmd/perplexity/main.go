@@ -328,8 +328,23 @@ func main() {
 	var prefillTokensTotal int
 	var prefillDurTotal time.Duration
 
-	for start := 0; start+1 < len(tokens); start += *ctxLen {
-		end := min(start+*ctxLen, len(tokens))
+	// PPL chunks: process complete ctxLen-sized chunks only, dropping any
+	// trailing partial. Reserving the tail leaves the decode benchmark a
+	// full ctxLen prefix already seeded in the KV cache and a few tokens
+	// beyond it to drive single-token decode steps. If the input is too
+	// short to contain even one full chunk plus decodeHeadroom, fall back
+	// to the original semantics so PPL still gets computed on what's
+	// available (decode timing skipped).
+	chunkStride := *ctxLen
+	pplLastFullEnd := (len(tokens) / chunkStride) * chunkStride
+	decodeFromCache := pplLastFullEnd >= chunkStride && len(tokens)-pplLastFullEnd >= decodeHeadroom
+	pplBound := len(tokens)
+	if decodeFromCache {
+		pplBound = pplLastFullEnd
+	}
+
+	for start := 0; start+1 < pplBound; start += *ctxLen {
+		end := min(start+*ctxLen, pplBound)
 		chunk := tokens[start:end]
 		n := len(chunk)
 		if n < 2 {
@@ -417,57 +432,56 @@ func main() {
 			math.Exp(totalNLL/float64(totalCount)))
 	}
 
-	// Decode benchmark.
-	// Clear the cache, do a short warmup prefill, then time single-token steps.
+	// Decode benchmark — reuses the KV cache state left by the final PPL
+	// chunk. The PPL loop already paid the prefill cost; doing a second
+	// full-ctx prefill just to fill the cache before timing decode steps
+	// roughly doubles the wall time of the whole sweep. Cache was sized
+	// ctxLen + decodeHeadroom (line 264-266) precisely so the warmup and
+	// timed steps fit beyond the prefilled prefix.
+	//
+	// For decode-pressure realism, size the input to a multiple of ctxLen
+	// so the final chunk is full (the last chunk's prefill seeds the cache
+	// for the decode that follows). A short trailing chunk leaves decode
+	// at sub-ctxLen pressure — usable but not directly comparable to a
+	// full-context run.
 	var decodeTPS float64
-	if cache != nil && len(tokens) > *decodeWarmup+*decodeSteps+1 {
-		// Use the full ctxLen as prefix so decode sees realistic KV bandwidth
-		// pressure. 32 tokens gave near-zero KV load, masking real differences.
-		if err := cache.Remove(0, 0, math.MaxInt32); err != nil {
-			log.Fatalf("cache.Remove: %v", err)
-		}
+	if cache != nil && decodeFromCache {
+		// Each PPL chunk uses local positions [0, n). After the chunk loop
+		// the cache holds the last full chunk; decode appends from
+		// position ctxLen against that prefix using tokens reserved beyond
+		// pplLastFullEnd.
+		pos := *ctxLen
+		nextTokenIdx := pplLastFullEnd
 
-		pfLen := min(*ctxLen, len(tokens)-1)
-		for sbStart := 0; sbStart < pfLen; sbStart += *maxBatch {
-			sbEnd := min(sbStart+*maxBatch, pfLen)
-			sbLen := sbEnd - sbStart
-			pfToks := make([]int32, sbLen)
-			pfPos := make([]int32, sbLen)
-			pfOut := make([]int32, 1)
-			pfOut[0] = int32(sbLen - 1) // only need last logit
-			for i := range sbLen {
-				pfToks[i] = int32(tokens[sbStart+i])
-				pfPos[i] = int32(sbStart + i)
-			}
-			runForward(m, pfToks, pfPos, pfOut)
-		}
-
-		// Warmup decode steps (untimed).
-		pos := pfLen
-		for range *decodeWarmup {
-			if pos >= len(tokens) {
-				break
-			}
-			tok := []int32{int32(tokens[pos])}
+		// Warmup decode steps (untimed). Bounded by decodeWarmup count and
+		// remaining input tokens; decodeHeadroom in cache covers position.
+		warmupBudget := *decodeWarmup
+		for warmupBudget > 0 && nextTokenIdx < len(tokens) {
+			tok := []int32{int32(tokens[nextTokenIdx])}
 			p := []int32{int32(pos)}
 			runForward(m, tok, p, []int32{0})
 			pos++
+			nextTokenIdx++
+			warmupBudget--
 		}
 
 		// Timed decode steps.
-		measuredSteps := min(*decodeSteps, len(tokens)-pos)
-		if measuredSteps > 0 {
+		stepsRemaining := *decodeSteps
+		if stepsRemaining > 0 && nextTokenIdx < len(tokens) {
 			t0 := time.Now()
-			for range measuredSteps {
-				if pos >= len(tokens) {
-					break
-				}
-				tok := []int32{int32(tokens[pos])}
+			measured := 0
+			for stepsRemaining > 0 && nextTokenIdx < len(tokens) {
+				tok := []int32{int32(tokens[nextTokenIdx])}
 				p := []int32{int32(pos)}
 				runForward(m, tok, p, []int32{0})
 				pos++
+				nextTokenIdx++
+				stepsRemaining--
+				measured++
 			}
-			decodeTPS = float64(measuredSteps) / time.Since(t0).Seconds()
+			if measured > 0 {
+				decodeTPS = float64(measured) / time.Since(t0).Seconds()
+			}
 		}
 	}
 
