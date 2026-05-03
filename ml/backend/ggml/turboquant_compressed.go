@@ -217,12 +217,29 @@ func (b *Backend) NewTQCompressedKManager(headDim, numKVHeads, bits int, rotatio
 	}
 	// Metal's kernel_tq_encode_outlier returns early (leaving packed buffers
 	// undefined) when asymmetric primary or QJL is requested — the kernel
-	// only implements symmetric outlier-split. Route those presets to f16 so
-	// the output is correct rather than silent garbage.
-	if scan.SelectedLibrary == "Metal" && outlierCount > 0 && (asymmetricPrimary || qjlRows > 0) {
-		slog.Warn("turboquant: *qa presets (asymmetric+outlier or QJL) not yet implemented on Metal; falling back to f16 KV cache",
-			"asymmetric", asymmetricPrimary, "qjl_rows", qjlRows, "outlier_count", outlierCount)
+	// only implements symmetric outlier-split.
+	//
+	// QJL-on (qjl_rows > 0) cannot be salvaged on Metal — fall back to f16.
+	// QJL is not part of any ship preset; this path is reachable only from
+	// directly-constructed test fixtures.
+	//
+	// Asymmetric-on without QJL: the simple kernel_tq_encode handles k_bias
+	// and per-block mean centring correctly; the corresponding fattn kernels
+	// already read K_zeros and apply the correction. We get a fully-working
+	// TQ compression by silently downgrading to asymmetric-only (clearing
+	// the outlier split). Users still get K-bias handling (the Qwen2 win)
+	// without losing TQ compression entirely. Replace this downgrade with a
+	// proper port once kernel_tq_encode_outlier learns asymmetric.
+	if scan.SelectedLibrary == "Metal" && qjlRows > 0 {
+		slog.Warn("turboquant: QJL not yet implemented on Metal; falling back to f16 KV cache",
+			"qjl_rows", qjlRows, "outlier_count", outlierCount)
 		return nil
+	}
+	if scan.SelectedLibrary == "Metal" && outlierCount > 0 && asymmetricPrimary {
+		slog.Warn("turboquant: Metal asymmetric+outlier kernel not yet ported; dropping outlier-split (asymmetric primary stays active — fully correct on Metal)",
+			"asymmetric", asymmetricPrimary, "outlier_count", outlierCount)
+		outlierCount = 0
+		outlierBits = 0
 	}
 
 	if len(scan.Accepted) > 1 {
