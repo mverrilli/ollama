@@ -51,8 +51,17 @@ static void tq_fattn_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     // V strides: only used by !V_PACKED path; pass V strides for the f16 case.
     // For the V_PACKED case these are passed but ignored by the kernel.
-    // smem: 16*D (combine/KQ region) + 2*D (s_Q_fixed, ncols_max=2) + 512 (s_dot_q_fixed, ncols_max*256)
-    constexpr size_t smem = (18 * D + 512) * sizeof(float);
+    // Per-block smem layout (see tq-fattn-vec.cuh:431-434):
+    //   [0, max(ne_KQ, ne_combine))  KQ + combine workspace
+    //   [..., +ncols*D)              s_Q_fixed (pre-scaled Q tile)
+    //   [..., +ncols*256)            s_dot_q_fixed (QJL projection scratch)
+    // ne_KQ      = ncols * D                                    (Q·K result tile)
+    // ne_combine = nwarps * V_cols_per_iter * D = 16 * D        (warp-VKQ reduce)
+    constexpr int ne_KQ      = ncols * D;
+    constexpr int ne_combine = 16 * D;  // nwarps(4) * V_cols_per_iter(4) * D
+    constexpr size_t smem    = ((ne_KQ > ne_combine ? ne_KQ : ne_combine)
+                                + ncols * D
+                                + ncols * 256) * sizeof(float);
 
     // ---- Multi-block KV-split heuristic ----
     // The TQ inline-decode kernel previously launched a fixed
@@ -263,7 +272,17 @@ void ggml_cuda_tq_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (logit_softcap != 0.0f) { scale /= logit_softcap; }
 
-    const int ncols = (nTokensQ == 1) ? 1 : 2;
+    // Q-tile size selection. Prefill amortises K+V decode across ncols Q-tokens;
+    // bigger ncols = fewer K+V re-decodes for the same nTokensQ. ncols=2 is
+    // the legacy size — for nTokensQ=2048 at ctx=16384 that means decoding all
+    // nCells K+V values 1024 times per layer. ncols=8 cuts that 4×.
+    //   nTokensQ == 1  → decode (ncols=1)
+    //   nTokensQ < 8   → small batch, ncols=2 keeps register pressure low
+    //   nTokensQ ≥ 8   → prefill, ncols=8 amortises decode
+    int ncols;
+    if (nTokensQ == 1)      ncols = 1;
+    else if (nTokensQ < 8)  ncols = 2;
+    else                    ncols = 8;
 
     const bool has_outliers = (outlier_count > 0);
 
@@ -295,8 +314,9 @@ void ggml_cuda_tq_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
     #define DISPATCH_NCOLS(DIM, SOFTCAP) \
-        if (ncols == 1) { DISPATCH(DIM, 1, SOFTCAP); } \
-        else            { DISPATCH(DIM, 2, SOFTCAP); }
+        if      (ncols == 1) { DISPATCH(DIM, 1, SOFTCAP); } \
+        else if (ncols == 2) { DISPATCH(DIM, 2, SOFTCAP); } \
+        else                 { DISPATCH(DIM, 8, SOFTCAP); }
 
     if (D == 64) {
         if (logit_softcap == 0.0f) { DISPATCH_NCOLS(64, false); }
