@@ -10252,9 +10252,10 @@ kernel void kernel_tq_dequant(
     // Fast path: when headDim is a multiple of 128 (=32 lanes × 4 elements per thread),
     // each thread decodes 4 consecutive D-positions per iter and writes a single half4.
     //   bits=2: 4 elems = 8 bits, always byte-aligned (shift0=0 since elem_base mod 4 == 0).
-    //   bits=3: 4 elems = 12 bits, shift0 ∈ {0,4}, always fits in a 16-bit window.
-    // A 16-bit window (2 packed bytes) suffices for both. The scalar fallback
-    // covers non-multiple-of-128 head dims.
+    //   bits=3: 4 elems = 12 bits, shift0 ∈ {0,4}, fits in a 16-bit window.
+    //   bits=4: 4 elems = 16 bits, shift0 = 0, fits in a 16-bit window.
+    // A 16-bit window (2 packed bytes) suffices for bits ≥ 3. The scalar
+    // fallback covers non-multiple-of-128 head dims.
     if ((args.headDim & 127) == 0) {
         const int iters = args.headDim >> 7;
         for (int iter = 0; iter < iters; iter++) {
@@ -10264,7 +10265,7 @@ kernel void kernel_tq_dequant(
             const int shift0      = bit_offset & 7;
 
             uint w = (uint)cell_packed[byte_base];
-            if (args.bits == 3) {
+            if (args.bits >= 3) {
                 w |= ((uint)cell_packed[byte_base + 1] << 8);
             }
 
