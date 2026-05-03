@@ -483,7 +483,14 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 		// fused path wins by avoiding the f16 intermediate write. This flag
 		// routes independently of preferFusedAttn so CUDA (preferFusedAttn=
 		// false) continues to take path 1 for everything.
-		useDequantKVForPrefill := c.preferFusedAttn && c.curQueryLen > 1
+		//
+		// Outlier presets skip DequantKV: Metal's kernel_tq_dequant (used by
+		// the DequantKV op for both K and V planes) decodes a single packed
+		// buffer per cell — it doesn't know about regular_packed +
+		// outlier_packed split. The slow K+V path (separate DequantK +
+		// DequantV → stock FA) routes K through kernel_tq_dequant_outlier
+		// which handles the split correctly.
+		useDequantKVForPrefill := c.preferFusedAttn && c.curQueryLen > 1 && !c.preset.HasOutlierSplit()
 
 		// 1. Combined K+V dequant → stock FA.
 		//    Metal prefill only (batched Q decodes each K cell once; stock FA
@@ -524,8 +531,9 @@ func (c *TurboQuantCache) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) 
 		}
 
 		// 1b. DequantKV fallback when Metal decode tried path 2 and the fused
-		//     path was unavailable (e.g. headDim outside 128/256).
-		if vEncodeResult != nil && c.preferFusedAttn {
+		//     path was unavailable (e.g. headDim outside 128/256). Skipped for
+		//     outlier presets — see useDequantKVForPrefill comment above.
+		if vEncodeResult != nil && c.preferFusedAttn && !c.preset.HasOutlierSplit() {
 			key, value := c.compressedK.DequantKV(ctx, layer, encodeResult, vEncodeResult, firstCell, nCells)
 			if key != nil && value != nil {
 				c.logPathOnce[1].Do(func() {

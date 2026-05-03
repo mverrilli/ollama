@@ -10324,16 +10324,18 @@ kernel void kernel_tq_dequant_outlier(
     const int cell = args.firstCell + c;
     const int slot = cell * args.numKVHeads + h;
 
-    // Asymmetric primary quantization and QJL residual sketch are not yet
-    // supported in the Metal dequant kernel. The host fallback should have
-    // routed to f16 KV storage instead. Returning early leaves outputs
-    // undefined — this path should never be reached in normal operation.
-    if (args.asymmetric || args.qjl_rows > 0) {
+    // QJL residual sketch is not yet implemented in the Metal dequant
+    // kernel. The host gates qjl-on configurations to f16; this path should
+    // not be reached in normal operation. asymmetric+outlier is supported
+    // (mirrors tq_dequant_multihead_kernel_outlier in tq-dequant.cu).
+    if (args.qjl_rows > 0) {
         return;
     }
 
     const float regScale = reg_scales[slot];
     const float outScale = out_scales[slot];
+    const float regZero  = args.asymmetric ? zeros[slot]         : 0.0f;
+    const float outZero  = args.asymmetric ? outlier_zeros[slot] : 0.0f;
     device const uint8_t * cell_reg  = reg_packed  + (long)slot * args.reg_packed_bytes;
     device const uint8_t * cell_outl = out_packed  + (long)slot * args.out_packed_bytes;
     device const uint8_t * cell_idx  = out_indices + (long)slot * args.outlier_count;
@@ -10389,7 +10391,10 @@ kernel void kernel_tq_dequant_outlier(
         if (reg_shift + args.bits > 8) {
             reg_idx |= ((int)(cell_reg[reg_byte_idx + 1] << (8 - reg_shift))) & cb_mask;
         }
-        const float reg_val = simd_shuffle(cb_lane_reg, (ushort)reg_idx) * regScale;
+        // Add the asymmetric per-sub-block mean back after scalar dequant
+        // so the f16 K matches the post-rotation pre-quant K. regZero/outZero
+        // are 0 in the symmetric path.
+        const float reg_val = simd_shuffle(cb_lane_reg, (ushort)reg_idx) * regScale + regZero;
 
         // Decode outlier sub-block (always, for warp convergence).
         const int out_slot_safe    = (outlier_slot >= 0) ? outlier_slot : 0;
@@ -10400,7 +10405,7 @@ kernel void kernel_tq_dequant_outlier(
         if (out_shift + args.outlier_bits > 8) {
             out_idx |= ((int)(cell_outl[out_byte_idx + 1] << (8 - out_shift))) & ocb_mask;
         }
-        const float out_val = simd_shuffle(cb_lane_out, (ushort)out_idx) * outScale;
+        const float out_val = simd_shuffle(cb_lane_out, (ushort)out_idx) * outScale + outZero;
 
         cell_out[elem] = half((outlier_slot >= 0) ? out_val : reg_val);
     }

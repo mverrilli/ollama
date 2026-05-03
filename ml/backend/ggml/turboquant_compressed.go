@@ -542,6 +542,15 @@ func (m *ggmlTQCompressedK) fusedKernelSupports() bool {
 	if m.hasOutliers() && m.vBits == 0 {
 		return false
 	}
+	// Metal does not yet have outlier-aware fattn kernels (kernel_tq_fattn_vec*
+	// read only the regular packed buffer; there is no kernel_tq_fattn_vec_outlier
+	// or kernel_tq_fattn_vec_packed_outlier on Metal). Force outlier presets to
+	// the DequantK + stock-FA slow path, which is correct after the
+	// kernel_tq_dequant_outlier asymmetric port. Once outlier-aware fattn is
+	// ported to Metal, drop this guard.
+	if m.hasOutliers() && m.preferFusedAttention {
+		return false
+	}
 	// K+V outlier path (tq*qa): GetAsTQTensorKV handles outlier decode inline.
 	// On Pascal (P40, cc 6.1) it is slower than DequantK + stockFA for single-
 	// token decode due to shared-memory pressure from the dual-stream loop.
