@@ -10721,6 +10721,7 @@ kernel void kernel_tq_encode_outlier(
     device const float   * qjl_projection    [[buffer(14)]],
     device const float   * codebook          [[buffer(15)]],
     device const float   * outlier_codebook  [[buffer(16)]],
+    device const float   * k_bias            [[buffer(17)]],
     uint3 tgpig   [[threadgroup_position_in_grid]],
     uint3 tpitg_v  [[thread_position_in_threadgroup]],
     uint3 ntpitg_v [[threads_per_threadgroup]])
@@ -10731,11 +10732,11 @@ kernel void kernel_tq_encode_outlier(
     const int head  = (int)tgpig.y;
     const int cell  = args.firstCell + batch;
 
-    // Asymmetric primary quantization and QJL residual sketch are not yet
-    // supported in the Metal encode kernel. The host fallback should have
-    // routed to f16 KV storage instead. Returning early leaves outputs
-    // undefined — this path should never be reached in normal operation.
-    if (args.asymmetric || args.qjl_rows > 0) {
+    // QJL residual sketch is not yet implemented in the Metal encode kernel.
+    // The host gate routes qjl-on configurations to f16 (no ship preset uses
+    // QJL — only test fixtures opt into it directly). asymmetric+outlier is
+    // now supported (ported from tq-encode.cu/tq_encode_kernel_outlier).
+    if (args.qjl_rows > 0) {
         return;
     }
 
@@ -10756,14 +10757,20 @@ kernel void kernel_tq_encode_outlier(
     const int outlierBits  = args.outlierBits;
     const int outlierCount = args.outlierCount;
 
-    // Step 1: Load K.
+    // Step 1: Load K, subtract K projection bias before rotation if present
+    // (Qwen2 attn_k.bias). Same pattern as kernel_tq_encode.
     const int base_k = batch * numKVHeads * headDim + head * headDim;
     for (int d = (int)tpitg; d < headDim; d += (int)ntpitg) {
+        float val;
         if (args.kIsF32) {
-            s_k[d] = ((device const float *)k_data)[base_k + d];
+            val = ((device const float *)k_data)[base_k + d];
         } else {
-            s_k[d] = float(((device const half *)k_data)[base_k + d]);
+            val = float(((device const half *)k_data)[base_k + d]);
         }
+        if (args.hasBias) {
+            val -= k_bias[head * headDim + d];
+        }
+        s_k[d] = val;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -10803,31 +10810,73 @@ kernel void kernel_tq_encode_outlier(
 
     const int regularCount = headDim - outlierCount;
 
-    // Step 4: Per-sub-block RMS scales.
-    float local_sq_reg = 0.0f, local_sq_out = 0.0f;
+    // Step 4: Per-sub-block stats. For symmetric: scale = sqrt(mean(v^2)).
+    // For asymmetric: mean = avg(v), scale = sqrt(mean((v-mean)^2)) = sqrt((sum_sq - n*mean^2)/n);
+    // mean is written to {zeros_out, outlier_zeros_out} for the decode kernels
+    // to add back. Race fix: all threads compute mean/scale from s_reduce[0]
+    // directly rather than write-back-then-read (matches tq-encode.cu after
+    // commit ac34ae96).
+    float local_sum_reg = 0.0f, local_sum_out = 0.0f;
+    float local_sq_reg  = 0.0f, local_sq_out  = 0.0f;
     for (int i = (int)tpitg; i < headDim; i += (int)ntpitg) {
-        float v = s_rot[i];
+        float v  = s_rot[i];
         float sq = v * v;
-        if (s_is_outlier[i]) local_sq_out += sq;
-        else                  local_sq_reg += sq;
+        if (s_is_outlier[i]) { local_sum_out += v; local_sq_out += sq; }
+        else                 { local_sum_reg += v; local_sq_reg += sq; }
     }
+
+    // ── Regular sub-block: regMean (asymmetric only) → regScale.
+    float regMean = 0.0f;
+    if (args.asymmetric) {
+        s_reduce[tpitg] = local_sum_reg;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
+            if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        regMean = (regularCount > 0) ? (s_reduce[0] / (float)regularCount) : 0.0f;
+        if (tpitg == 0) {
+            zeros_out[cell * numKVHeads + head] = regMean;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     s_reduce[tpitg] = local_sq_reg;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
         if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // All threads compute regScale from the reduction sum directly.
     float regScale = 0.0f;
     {
         const float sum_sq = s_reduce[0];
-        if (sum_sq > 1e-12f && regularCount > 0)
-            regScale = sqrt(sum_sq / (float)regularCount);
+        if (regularCount > 0) {
+            float effective_sq = args.asymmetric
+                ? (sum_sq - (float)regularCount * regMean * regMean)
+                : sum_sq;
+            if (effective_sq > 1e-12f) regScale = sqrt(effective_sq / (float)regularCount);
+        }
     }
     if (tpitg == 0) {
         scales_out[cell * numKVHeads + head] = regScale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Outlier sub-block: outMean (asymmetric only) → outScale.
+    float outMean = 0.0f;
+    if (args.asymmetric) {
+        s_reduce[tpitg] = local_sum_out;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntpitg >> 1; stride > 0; stride >>= 1) {
+            if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        outMean = (outlierCount > 0) ? (s_reduce[0] / (float)outlierCount) : 0.0f;
+        if (tpitg == 0) {
+            outlier_zeros_out[cell * numKVHeads + head] = outMean;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     s_reduce[tpitg] = local_sq_out;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -10835,23 +10884,27 @@ kernel void kernel_tq_encode_outlier(
         if (tpitg < stride) s_reduce[tpitg] += s_reduce[tpitg + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // All threads compute outScale from the reduction sum directly.
     float outScale = 0.0f;
     {
         const float sum_sq = s_reduce[0];
-        if (sum_sq > 1e-12f && outlierCount > 0)
-            outScale = sqrt(sum_sq / (float)outlierCount);
+        if (outlierCount > 0) {
+            float effective_sq = args.asymmetric
+                ? (sum_sq - (float)outlierCount * outMean * outMean)
+                : sum_sq;
+            if (effective_sq > 1e-12f) outScale = sqrt(effective_sq / (float)outlierCount);
+        }
     }
     if (tpitg == 0) {
         outlier_scales[cell * numKVHeads + head] = outScale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 5: Quantize regular channels.
+    // Step 5: Quantize regular channels — centre by regMean if asymmetric
+    // (regMean=0 for symmetric so the same expression works either way).
     const int numBoundaries = (1 << bits) - 1;
     for (int r = (int)tpitg; r < regularCount; r += (int)ntpitg) {
         const int orig = s_reg_pos[r];
-        float v = (regScale > 0.0f) ? (s_rot[orig] / regScale) : 0.0f;
+        float v = (regScale > 0.0f) ? ((s_rot[orig] - regMean) / regScale) : 0.0f;
         int idx = 0;
         for (int b = 0; b < numBoundaries; b++) { if (v >= boundaries[b]) idx++; }
         s_idx[r] = (uint8_t)idx;
@@ -10890,10 +10943,11 @@ kernel void kernel_tq_encode_outlier(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 7: Quantize outlier channels.
+    // Step 7: Quantize outlier channels — centre by outMean if asymmetric
+    // (outMean=0 for symmetric).
     const int numOutlierBoundaries = (1 << outlierBits) - 1;
     for (int r = (int)tpitg; r < outlierCount; r += (int)ntpitg) {
-        float v = (outScale > 0.0f) ? (s_outl_val[r] / outScale) : 0.0f;
+        float v = (outScale > 0.0f) ? ((s_outl_val[r] - outMean) / outScale) : 0.0f;
         int idx = 0;
         for (int b = 0; b < numOutlierBoundaries; b++) { if (v >= outlier_boundaries[b]) idx++; }
         s_outl_idx[r] = (uint8_t)idx;
