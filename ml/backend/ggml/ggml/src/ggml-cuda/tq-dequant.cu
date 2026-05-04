@@ -353,6 +353,23 @@ __global__ void tq_dequant_kv_kernel_outlier(
         }
         __syncthreads();
 
+        // Precompute prefix-sum of popcounts so each element only needs one
+        // popc (the partial-word bits below `elem`). Without this, every
+        // element ran a 4-iteration unrolled popc loop in registers.
+        // mask_words ≤ 8 for D ≤ 256; popc_prefix[w] = sum of popcounts of
+        // s_mask[0..w-1], so popc_prefix[full_words] is the count of
+        // outliers strictly below `elem`'s 32-bit word.
+        __shared__ int s_popc_prefix[9];
+        if (threadIdx.x == 0) {
+            int acc = 0;
+            s_popc_prefix[0] = 0;
+            for (int w = 0; w < mask_words; w++) {
+                acc += __popc(s_mask[w]);
+                s_popc_prefix[w + 1] = acc;
+            }
+        }
+        __syncthreads();
+
         const float regScale = k_reg_scales[slot];
         const float outScale = k_outl_scales[slot];
         const float regZero  = k_zeros      ? k_zeros[slot]      : 0.0f;
@@ -369,14 +386,8 @@ __global__ void tq_dequant_kv_kernel_outlier(
         for (int elem = threadIdx.x; elem < headDim; elem += blockDim.x) {
             int outlier_slot = (int)s_outl_slot[elem];
 
-            int outliers_below = 0;
             const int full_words = elem >> 5;
-            #pragma unroll
-            for (int w = 0; w < 8; w++) {
-                if (w < full_words && w < mask_words) {
-                    outliers_below += __popc(s_mask[w]);
-                }
-            }
+            int outliers_below = s_popc_prefix[full_words];
             if (full_words < mask_words) {
                 uint32_t partial_bits = (1u << (elem & 31)) - 1u;
                 outliers_below += __popc(s_mask[full_words] & partial_bits);
@@ -651,11 +662,18 @@ void ggml_cuda_tq_dequant_kv(ggml_backend_cuda_context & ctx, struct ggml_tensor
     const bool k_has_outliers = (k_outl_packed != nullptr) && outlier_count > 0
                                 && outlier_bits > 0 && outlier_count < headDim;
 
-    // Default: combined K+V kernel (one launch per layer; halves scheduler
-    // ops and amortises per-block overhead). Only the K-outlier + V-simple
-    // case is fused — non-outlier K and the rare K-only configurations still
-    // take the legacy two-kernel split below.
-    if (k_has_outliers && !tq_dequant_split_kv_override()) {
+    // Default: combined K+V kernel on CUDA (one launch per layer; halves
+    // scheduler ops, +3.5% decode on Pascal P40). Disabled on HIP because
+    // RDNA3 gfx1102 regresses ~11% — the combined kernel's per-block smem
+    // (headDim int8 outlier-slot map + mask_words uint32 bitmap) hurts
+    // occupancy/LDS bank-conflict behaviour relative to two lightweight
+    // separate kernels. Pascal benefits from the amortised per-block work;
+    // RDNA3 doesn't. OLLAMA_TQ_DEQUANT_SPLIT_KV=1 forces split on either.
+    bool use_combined = k_has_outliers && !tq_dequant_split_kv_override();
+#ifdef GGML_USE_HIP
+    use_combined = false;
+#endif
+    if (use_combined) {
         const int regular_count    = headDim - outlier_count;
         const int reg_packed_raw   = (regular_count * k_bits + 7) / 8;
         const int reg_packed_bytes = (reg_packed_raw + 3) & ~3;
