@@ -19,6 +19,20 @@ static int tq_dequant_block_size_override() {
     return cached;
 }
 
+// OLLAMA_TQ_DEQUANT_SPLIT_KV=1 falls back to the legacy two-kernel path
+// (separate K and V launches) for diagnostic A/B vs the combined kernel.
+// Default is the combined path which halves the per-layer launches.
+static bool tq_dequant_split_kv_override() {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 0;
+        if (const char * env = std::getenv("OLLAMA_TQ_DEQUANT_SPLIT_KV")) {
+            cached = std::atoi(env) != 0 ? 1 : 0;
+        }
+    }
+    return cached != 0;
+}
+
 // Optimized TQ dequant kernel: warp-shuffle codebook + hardcoded bit extraction.
 //
 // Grid: (nCells, numKVHeads).  Block: 64 threads (each thread decodes 2 elems
@@ -271,6 +285,168 @@ __global__ void tq_dequant_multihead_kernel_outlier(
     const float *, const float *, const uint8_t *, const float *, const float *, int, int) {}
 #endif
 
+// ── Combined K (outlier) + V (simple) dequant in a single kernel ──
+// Same grid (nCells, numKVHeads) as the separate kernels, but each block
+// dequants both planes for its (cell, head) before exiting. Halves the
+// per-layer ggml_cuda_tq_dequant_kv kernel-call count and amortises the
+// per-block scale/slot fetch across both planes.
+//
+// V is symmetric and outlier-free in every ship preset, so the V phase
+// uses the simple-kernel codepath. K is always outlier-aware here (the
+// non-outlier K case still hits the separate simple kernel above for now;
+// this combined path is the one path 1 actually uses by default).
+#if __CUDA_ARCH__ >= 600 || !defined(__CUDA_ARCH__)
+__global__ void tq_dequant_kv_kernel_outlier(
+    // K (outlier-aware)
+    const uint8_t *k_reg_packed,
+    const float   *k_reg_scales,
+    const float   *k_reg_codebook,
+    const uint8_t *k_outl_packed,
+    const float   *k_outl_scales,
+    const uint8_t *k_outl_indices,
+    const float   *k_outl_codebook,
+    const float   *k_zeros,
+    const float   *k_outl_zeros,
+    int            k_bits,
+    int            k_reg_packed_bytes,
+    int            k_outl_bits,
+    int            k_outl_count,
+    int            k_outl_packed_bytes,
+    // V (simple)
+    const uint8_t *v_packed,
+    const float   *v_scales,
+    const float   *v_codebook,
+    int            v_bits,
+    int            v_packed_bytes,
+    // Output (two planes)
+    uint16_t      *output_k,
+    uint16_t      *output_v,
+    // Geometry
+    int headDim, int numKVHeads, int firstCell)
+{
+    const int c    = blockIdx.x;
+    const int h    = blockIdx.y;
+    const int cell = firstCell + c;
+    const int slot = cell * numKVHeads + h;
+
+    // Shared memory for K outlier classification (reused only by K phase).
+    const int mask_words = (headDim + 31) >> 5;
+    extern __shared__ char s_mem_dq[];
+    int8_t   *s_outl_slot = (int8_t   *)s_mem_dq;
+    uint32_t *s_mask      = (uint32_t *)(s_outl_slot + headDim);
+
+    // K phase: build outlier mask, decode K plane.
+    {
+        for (int i = threadIdx.x; i < headDim; i += blockDim.x) {
+            s_outl_slot[i] = -1;
+        }
+        for (int w = threadIdx.x; w < mask_words; w += blockDim.x) {
+            s_mask[w] = 0u;
+        }
+        __syncthreads();
+
+        if ((int)threadIdx.x < k_outl_count) {
+            const uint8_t *cell_idx = k_outl_indices + (size_t)slot * k_outl_count;
+            int pos = (int)cell_idx[threadIdx.x];
+            s_outl_slot[pos] = (int8_t)threadIdx.x;
+            atomicOr(&s_mask[pos >> 5], 1u << (pos & 31));
+        }
+        __syncthreads();
+
+        const float regScale = k_reg_scales[slot];
+        const float outScale = k_outl_scales[slot];
+        const float regZero  = k_zeros      ? k_zeros[slot]      : 0.0f;
+        const float outZero  = k_outl_zeros ? k_outl_zeros[slot] : 0.0f;
+        const uint8_t *cell_reg  = k_reg_packed  + (size_t)slot * k_reg_packed_bytes;
+        const uint8_t *cell_outl = k_outl_packed + (size_t)slot * k_outl_packed_bytes;
+        __half *cell_out = (__half *)(output_k + ((size_t)c * numKVHeads + h) * headDim);
+
+        const int cb_mask  = (1 << k_bits) - 1;
+        const int ocb_mask = (1 << k_outl_bits) - 1;
+        const float cb_lane_reg = k_reg_codebook[threadIdx.x & cb_mask];
+        const float cb_lane_out = k_outl_codebook[threadIdx.x & ocb_mask];
+
+        for (int elem = threadIdx.x; elem < headDim; elem += blockDim.x) {
+            int outlier_slot = (int)s_outl_slot[elem];
+
+            int outliers_below = 0;
+            const int full_words = elem >> 5;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                if (w < full_words && w < mask_words) {
+                    outliers_below += __popc(s_mask[w]);
+                }
+            }
+            if (full_words < mask_words) {
+                uint32_t partial_bits = (1u << (elem & 31)) - 1u;
+                outliers_below += __popc(s_mask[full_words] & partial_bits);
+            }
+            int regular_slot = elem - outliers_below;
+
+            int reg_bit_offset = regular_slot * k_bits;
+            int reg_byte_idx   = reg_bit_offset >> 3;
+            int reg_shift      = reg_bit_offset & 7;
+            int reg_idx = (cell_reg[reg_byte_idx] >> reg_shift) & cb_mask;
+            if (reg_shift + k_bits > 8) {
+                reg_idx |= (cell_reg[reg_byte_idx + 1] << (8 - reg_shift)) & cb_mask;
+            }
+            // Mul-only here; zero added after the outlier/regular select to
+            // match tq_dequant_multihead_kernel_outlier's rounding (separate
+            // mul then add, not FMA fusion). Combined output must be bit-
+            // for-bit identical to the split-kernel output.
+            float reg_val = __shfl_sync(0xFFFFFFFF, cb_lane_reg, reg_idx, 32) * regScale;
+
+            int out_slot_safe = (outlier_slot >= 0) ? outlier_slot : 0;
+            int out_bit_offset = out_slot_safe * k_outl_bits;
+            int out_byte_idx   = out_bit_offset >> 3;
+            int out_shift      = out_bit_offset & 7;
+            int out_idx = (cell_outl[out_byte_idx] >> out_shift) & ocb_mask;
+            if (out_shift + k_outl_bits > 8) {
+                out_idx |= (cell_outl[out_byte_idx + 1] << (8 - out_shift)) & ocb_mask;
+            }
+            float out_val = __shfl_sync(0xFFFFFFFF, cb_lane_out, out_idx, 32) * outScale;
+
+            float val = (outlier_slot >= 0) ? out_val : reg_val;
+            if (k_zeros) {
+                val += (outlier_slot >= 0) ? outZero : regZero;
+            }
+            cell_out[elem] = __float2half_rn(val);
+        }
+    }
+
+    // V phase: independent of K, no shared memory needed.
+    {
+        const float v_scale = v_scales[slot];
+        const uint8_t *cell_v = v_packed + (size_t)slot * v_packed_bytes;
+        __half *cell_v_out = (__half *)(output_v + ((size_t)c * numKVHeads + h) * headDim);
+
+        const int v_cb_mask = (1 << v_bits) - 1;
+        const float v_cb_lane = v_codebook[threadIdx.x & v_cb_mask];
+
+        for (int elem = threadIdx.x; elem < headDim; elem += blockDim.x) {
+            const int bit_offset = elem * v_bits;
+            const int byte_idx   = bit_offset >> 3;
+            const int shift      = bit_offset & 7;
+
+            int idx = (cell_v[byte_idx] >> shift) & v_cb_mask;
+            if (shift + v_bits > 8) {
+                idx |= (cell_v[byte_idx + 1] << (8 - shift)) & v_cb_mask;
+            }
+            float val = __shfl_sync(0xFFFFFFFF, v_cb_lane, idx, 32) * v_scale;
+            cell_v_out[elem] = __float2half_rn(val);
+        }
+    }
+}
+#else
+__global__ void tq_dequant_kv_kernel_outlier(
+    const uint8_t *, const float *, const float *,
+    const uint8_t *, const float *, const uint8_t *, const float *,
+    const float *, const float *,
+    int, int, int, int, int,
+    const uint8_t *, const float *, const float *, int, int,
+    uint16_t *, uint16_t *, int, int, int) {}
+#endif
+
 void ggml_cuda_tq_dequant(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_info().devices[ctx.device].cc >= 600 &&
                 "TurboQuant dequant requires compute capability 6.0+ (Pascal or newer)");
@@ -470,10 +646,47 @@ void ggml_cuda_tq_dequant_kv(ggml_backend_cuda_context & ctx, struct ggml_tensor
     uint16_t * out_base = (uint16_t *)dst->data;
 
     cudaStream_t stream = ctx.stream();
+    (void)v_rotation; // SDPA applies V rotation undo via mulmat
 
-    // K dequant → first plane (offset 0) — always unrotated.
     const bool k_has_outliers = (k_outl_packed != nullptr) && outlier_count > 0
                                 && outlier_bits > 0 && outlier_count < headDim;
+
+    // Default: combined K+V kernel (one launch per layer; halves scheduler
+    // ops and amortises per-block overhead). Only the K-outlier + V-simple
+    // case is fused — non-outlier K and the rare K-only configurations still
+    // take the legacy two-kernel split below.
+    if (k_has_outliers && !tq_dequant_split_kv_override()) {
+        const int regular_count    = headDim - outlier_count;
+        const int reg_packed_raw   = (regular_count * k_bits + 7) / 8;
+        const int reg_packed_bytes = (reg_packed_raw + 3) & ~3;
+        const int out_packed_raw   = (outlier_count * outlier_bits + 7) / 8;
+        const int out_packed_bytes = (out_packed_raw + 3) & ~3;
+        const int mask_words       = (headDim + 31) >> 5;
+        const size_t smem = (size_t)headDim * sizeof(int8_t)
+                          + (size_t)mask_words * sizeof(uint32_t);
+
+        tq_dequant_kv_kernel_outlier<<<grid, block_size, smem, stream>>>(
+            (const uint8_t *)k_encode->data,
+            (const float   *)k_scales->data,
+            (const float   *)k_cb->data,
+            (const uint8_t *)k_outl_packed->data,
+            (const float   *)k_outl_scales->data,
+            (const uint8_t *)k_outl_indices->data,
+            (const float   *)k_outl_codebook->data,
+            k_zeros      ? (const float *)k_zeros->data      : nullptr,
+            k_outl_zeros ? (const float *)k_outl_zeros->data : nullptr,
+            k_bits, reg_packed_bytes, outlier_bits, outlier_count, out_packed_bytes,
+            (const uint8_t *)v_encode->data,
+            (const float   *)v_scales->data,
+            (const float   *)v_cb->data,
+            v_bits, v_packed_bytes,
+            out_base, out_base + plane_size,
+            headDim, numKVHeads, firstCell
+        );
+        return;
+    }
+
+    // K dequant → first plane (offset 0) — always unrotated.
     if (k_has_outliers) {
         const int regular_count    = headDim - outlier_count;
         const int reg_packed_raw   = (regular_count * k_bits + 7) / 8;
@@ -517,7 +730,6 @@ void ggml_cuda_tq_dequant_kv(ggml_backend_cuda_context & ctx, struct ggml_tensor
     // V dequant → second plane (offset plane_size). Plain dequant only — the
     // rotation undo (R @ attn_out) is handled by SDPA via mulmat, which is
     // dramatically faster than the per-cell matmul the fused kernel did.
-    (void)v_rotation;
     tq_dequant_multihead_kernel<<<grid, block_size, 0, stream>>>(
         (const uint8_t *)v_encode->data,
         (const float   *)v_scales->data,
