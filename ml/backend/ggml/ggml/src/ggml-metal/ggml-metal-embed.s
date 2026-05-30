@@ -1,3 +1,4 @@
+// DO NOT EDIT — updated to embed current ggml-metal-embed.metal
 .section __DATA, __ggml_metallib
 .globl _ggml_metallib_start
 _ggml_metallib_start:
